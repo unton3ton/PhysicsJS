@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>DPSS: термолинза + шум накачки (green noise)</title>
+<style>
+  html,body{background:#0b0d12;color:#dfe6f3;font-family:system-ui,Segoe UI,Arial;margin:0;padding:12px}
+  h2{text-align:center;font-weight:600;margin:2px 0 8px;font-size:17px}
+  .controls{display:flex;gap:12px;align-items:center;justify-content:center;flex-wrap:wrap;margin-bottom:6px;font-size:13px}
+  .controls label{display:flex;align-items:center;gap:5px}
+  canvas{display:block;margin:0 auto;background:#05060a;border:1px solid #223;border-radius:10px}
+  button,select{background:#1c2333;color:#dfe6f3;border:1px solid #35405a;border-radius:6px;padding:4px 9px;font-size:13px;cursor:pointer}
+  button:hover{background:#27304a}
+  #fire{background:#3a1c1c;border-color:#7a3030;color:#ffd0c0}
+  #align{background:#1c3a2a;border-color:#307a50;color:#c0ffe0}
+  #info{max-width:1180px;margin:8px auto 0;font-size:12.5px;line-height:1.5;color:#b9c6de;
+        display:grid;grid-template-columns:repeat(4,1fr);gap:4px 14px}
+  #info b{color:#eef3ff}
+  .sub{grid-column:1/-1;color:#7f90ad;font-size:11px;border-top:1px solid #223;padding-top:4px}
+</style>
+</head>
+<body>
+<h2>Зелёный DPSS: скоростные уравнения · SHG · Q-switch · термолинза · шум накачки (green noise)</h2>
+<div class="controls">
+  <label>Накачка 808 <input id="pump" type="range" min="0" max="800" value="350"><span id="pv"></span></label>
+  <label>Шум накачки <input id="noise" type="range" min="0" max="100" value="25"><span id="nv"></span></label>
+  <label>Режим <select id="mode">
+    <option value="qswitch">Q-switching</option>
+    <option value="cw">CW</option>
+  </select></label>
+  <label id="replab">Частота <input id="rep" type="range" min="1" max="5000" value="1000"><span id="repv"></span></label>
+  <button id="fire">Огнь</button>
+  <label>T KTP <input id="temp" type="range" min="0" max="100" value="50"></label>
+  <label>Скорость <input id="speed" type="range" min="0" max="100" value="45"></label>
+  <label><input id="slowmo" type="checkbox" checked> замедление</label>
+  <button id="align">Выровнять</button>
+  <button id="pause">Пауза</button>
+  <button id="reset">Сброс</button>
+</div>
+<canvas id="c" width="1180" height="700"></canvas>
+<div id="info"></div>
+
+<script>
+'use strict';
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const W=cv.width,H=cv.height,AXIS=190;
+const hP=6.62607015e-34,cL=2.99792458e8;
+const LAM_P=808e-9,LAM_L=1064e-9,LAM_G=532e-9;
+const MAT={N_total:1e26,tau_f:230e-6,sigma:2.8e-23,n:1.82,alpha:0.5,beta:1e-5};
+const GEO={L_g:5e-3,L_c:0.06,A:2e-8,R1:0.999};
+const KAPPA0=5e-3,ETA_G=0.85,ETA_ABS=0.8,deltaQS=4.0,t_open=1e-5,R2=0.90;
+const TAU_TH=40e-3,HEAT_FRAC=0.30,F0_TH=0.012;
+const R_OC=0.12,L1ND=0.02,L2KTP=0.04;
+const W_PUMP=90e-6,W_K0=150e-6;
+const TAU_N1=3e-3,TAU_N2=2e-6;
+const MAX_STEPS=15000,SLOW_SIM=1.5e-10,SLOWMO_WIN=8e-6;
+
+let mode='qswitch',Ppump=0.350,rep=1000,tempVal=50,noiseAmp=0.15;
+let hvp,hvl,hvg,t_rt,Vg,Gcoef,dPass0,dOC,Wp0max;
+let n2=0,phi=0,t=0;
+let switchClosed=true,tOpened=0,tLastOpen=0,manualFire=false,slowmoUntil=-1;
+let avgPG=0,pulseCap=null,lastPulse=null,pulseCount=0,totalE=0;
+let samples=[],nextSampleT=0,t_sample=1e-6,curSpeed=2e-5;
+let paused=false,autoSlow=true,pulseActive=false;
+let pHeat=0,y1=0,y2=0;
+let modeCache=null,thNow=1;
+const lens={x0:148,x1:178,off:0,grab:0,half:46,name:'линза'};
+const ktpE={x0:408,x1:492,off:0,grab:0,half:44,name:'KTP'};
+let dragIt=null,hoverIt=null;
+
+function recompute(){
+  hvp=hP*cL/LAM_P;hvl=hP*cL/LAM_L;hvg=hP*cL/LAM_G;
+  t_rt=2*(GEO.L_c+(MAT.n-1)*GEO.L_g)/cL;
+  Vg=GEO.A*GEO.L_g;
+  Gcoef=2*MAT.sigma*GEO.L_g/t_rt;
+  dPass0=2*MAT.alpha*GEO.L_g+Math.log(1/(GEO.R1*R2));
+  dOC=Math.log(1/R2);
+  Wp0max=ETA_ABS*0.8/(hvp*Vg);
+}
+const Pm=d=>[1,d,0,1],Lm=f=>[1,0,-1/f,1];
+function mmul(m,n){return[m[0]*n[0]+m[1]*n[2],m[0]*n[1]+m[1]*n[3],
+  m[2]*n[0]+m[3]*n[2],m[2]*n[1]+m[3]*n[3]];}
+function cinv(z){const d=z.re*z.re+z.im*z.im;return{re:z.re/d,im:-z.im/d};}
+function wFromQ(q){const iq=cinv(q);
+  return Math.sqrt(LAM_L/(Math.PI*Math.max(1e-9,Math.abs(iq.im))));}
+function modeParams(fth){
+  let m=Pm(L1ND);
+  m=mmul(Lm(fth),m);
+  m=mmul(Pm(GEO.L_c-L1ND),m);
+  m=mmul([1,0,-2/R_OC,1],m);
+  m=mmul(Pm(GEO.L_c-L1ND),m);
+  m=mmul(Lm(fth),m);
+  m=mmul(Pm(L1ND),m);
+  const g=(m[0]+m[3])/2,s=1-g*g;
+  if(s<=1e-9||Math.abs(m[1])<1e-12)
+    return{stable:false,s,wc:280e-6,wk:280e-6,wo:320e-6};
+  const iqRe=(m[0]-m[3])/(2*m[1]);
+  const iqIm=-Math.sqrt(Math.max(s,0))/Math.abs(m[1]);
+  const den=iqRe*iqRe+iqIm*iqIm;
+  let q={re:iqRe/den,im:-iqIm/den};
+  q.re+=L1ND;
+  const wc=Math.min(400e-6,Math.max(15e-6,wFromQ(q)));
+  let iq=cinv(q);iq.re-=1/fth;q=cinv(iq);
+  q.re+=(L2KTP-L1ND);
+  const wk=Math.min(400e-6,Math.max(15e-6,wFromQ(q)));
+  q.re+=(GEO.L_c-L2KTP);
+  const wo=Math.min(500e-6,Math.max(15e-6,wFromQ(q)));
+  return{stable:true,s,wc,wk,wo};
+}
+const fTh=()=>Math.min(F0_TH/Math.max(pHeat,2e-4),60);
+function etaCoup(){
+  const mc=modeCache,wc=mc.wc,d=lens.off*3e-6;
+  const g2=Math.pow(2*W_PUMP*wc/(W_PUMP*W_PUMP+wc*wc),2);
+  return g2*Math.exp(-2*d*d/(W_PUMP*W_PUMP+wc*wc))*Math.exp(-Math.pow(lens.off/60,2));
+}
+function etaKtp(){
+  const d=ktpE.off*2e-6,s=modeCache.wk*0.5+8e-6;
+  return Math.exp(-d*d/(2*s*s))*Math.exp(-Math.pow(ktpE.off/60,2));
+}
+const dStab=()=>2.0/(1+Math.exp(modeCache.s/0.03));
+const dAlign=()=>0.12*(Math.pow(lens.off/45,2)+Math.pow(ktpE.off/45,2));
+function pmFac(){const dT=(tempVal-50)*0.36,x=dT*0.30;
+  return Math.abs(x)<1e-9?1:Math.pow(Math.sin(x)/x,2);}
+const kappa=()=>KAPPA0*pmFac()*etaKtp()*Math.pow(W_K0/Math.max(modeCache.wk,15e-6),2);
+const curDelta=()=>dPass0+dAlign()+dStab()+((mode==='qswitch'&&switchClosed)?deltaQS:0);
+function randn(){
+  let u=Math.random(),v=Math.random();
+  while(u===0) u=Math.random();
+  while(v===0) v=Math.random();
+  return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);
+}
+function noiseFactor(){
+  const v=noiseAmp*(0.65*y1+0.35*y2);
+  if(!isFinite(v)) return 1;
+  return Math.max(0.02,Math.min(3,1+v));
+}
+const Wp0cur=()=>ETA_ABS*Ppump/(hvp*Vg)*etaCoup()*noiseFactor();
+const Pgreen=()=>kappa()*phi*phi/2*hvg*ETA_G;
+const Pcirc=()=>phi*hvl/t_rt;
+const Pleak=()=>phi*hvl*dOC/t_rt;
+function deriv(n2v,phiv){
+  const tau_c=t_rt/curDelta();
+  return[Wp0cur()-n2v/MAT.tau_f-Gcoef*n2v*phiv/Vg,
+    (Gcoef*n2v-1/tau_c)*phiv-kappa()*phiv*phiv+MAT.beta*n2v*Vg/MAT.tau_f];
+}
+function chooseDt(){
+  const tau_c=t_rt/curDelta();
+  const lam=Math.abs(Gcoef*n2-1/tau_c)+2*kappa()*phi+1/tau_c;
+  let dt=0.15/Math.max(lam,1e3);
+  return Math.max(1e-13,Math.min(dt,1e-6));
+}
+function updateQS(){
+  if(mode!=='qswitch'){switchClosed=false;return;}
+  if(switchClosed){
+    if(manualFire||(t-tLastOpen)>=1/rep){
+      switchClosed=false;tOpened=t;manualFire=false;
+      if(autoSlow)slowmoUntil=t+SLOWMO_WIN;
+    }
+  }else if(t-tOpened>=t_open){switchClosed=true;tLastOpen=t;}
+}
+function nextEvent(){
+  if(mode!=='qswitch')return null;
+  return switchClosed?(manualFire?t:tLastOpen+1/rep):(tOpened+t_open);
+}
+function detectPulse(){
+  if(mode!=='qswitch')return;
+  const P=Pgreen();
+  if(!pulseCap&&P>2)pulseCap={t0:t,E:0,peak:0,lastP:P,lastT:t,s:[]};
+  if(pulseCap){
+    pulseCap.E+=0.5*(P+pulseCap.lastP)*(t-pulseCap.lastT);
+    pulseCap.lastP=P;pulseCap.lastT=t;
+    if(P>pulseCap.peak)pulseCap.peak=P;
+    pulseCap.s.push([t,P]);if(pulseCap.s.length>6000)pulseCap.s.shift();
+    if(P<1&&t-pulseCap.t0>5e-8){
+      const half=pulseCap.peak/2;let a=null,b=null;
+      for(const[x,y]of pulseCap.s){if(y>=half){if(a===null)a=x;b=x;}}
+      lastPulse={E:pulseCap.E,peak:pulseCap.peak,fwhm:a!==null?b-a:null};
+      pulseCount++;totalE+=pulseCap.E;pulseCap=null;
+    }
+  }
+}
+function pushSample(){
+  samples.push({t,n2,pg:Pgreen(),pc:Pcirc()});
+  const tw=graphWindow();
+  while(samples.length&&samples[0].t<t-tw)samples.shift();
+}
+function advance(dur){
+  const tEnd=t+dur;let steps=0;
+  while(t<tEnd&&steps<MAX_STEPS){
+    updateQS();
+    const dt0=Math.max(1e-12, Math.min(1e-5, tEnd-t));
+    const c1=Math.sqrt(2*dt0/TAU_N1),c2=Math.sqrt(2*dt0/TAU_N2);
+    if(isFinite(c1)&&isFinite(c2)){
+      y1+=(-y1/TAU_N1)*dt0+c1*randn();
+      y2+=(-y2/TAU_N2)*dt0+c2*randn();
+      if(!isFinite(y1)) y1=0;
+      if(!isFinite(y2)) y2=0;
+    }
+    const phT=HEAT_FRAC*ETA_ABS*Ppump*(1+0.4*noiseAmp*y1);
+    pHeat+=(phT-pHeat)*Math.min(1,dt0/TAU_TH);
+    if(!isFinite(pHeat)) pHeat=0;
+
+    const ev=nextEvent();
+    const tau_c=t_rt/curDelta();
+    const netG=Gcoef*n2-1/tau_c;
+    let dt;
+    if(phi<0.5&&netG<0){
+      phi=MAT.beta*n2*Vg/MAT.tau_f/(-netG);
+      dt=Math.min(0.05*MAT.tau_f,1e-5,tEnd-t);
+      if(ev!==null&&ev-t>1e-14)dt=Math.min(dt,ev-t);
+      if(dt<=0)dt=1e-13;
+      const f=x=>Wp0cur()-x/MAT.tau_f-Gcoef*x*phi/Vg;
+      const k1=f(n2),k2=f(n2+.5*dt*k1),k3=f(n2+.5*dt*k2),k4=f(n2+dt*k3);
+      n2+=dt/6*(k1+2*k2+2*k3+k4);
+    }else{
+      dt=chooseDt();
+      dt=Math.min(dt,tEnd-t);
+      if(ev!==null&&ev-t>1e-14)dt=Math.min(dt,ev-t);
+      if(dt<=0)dt=1e-13;
+      const k1=deriv(n2,phi);
+      const k2=deriv(n2+.5*dt*k1[0],phi+.5*dt*k1[1]);
+      const k3=deriv(n2+.5*dt*k2[0],phi+.5*dt*k2[1]);
+      const k4=deriv(n2+dt*k3[0],phi+dt*k3[1]);
+      n2+=dt/6*(k1[0]+2*k2[0]+2*k3[0]+k4[0]);
+      phi+=dt/6*(k1[1]+2*k2[1]+2*k3[1]+k4[1]);
+    }
+    if(n2<0)n2=0;if(n2>MAT.N_total)n2=MAT.N_total;if(phi<0)phi=0;
+    avgPG+=(Pgreen()-avgPG)*Math.min(1,dt/1e-3);
+    t+=dt;steps++;
+    if(t>=nextSampleT){pushSample();nextSampleT+=t_sample;}
+    detectPulse();
+  }
+}
+const graphWindow=()=>mode==='qswitch'?Math.max(4/rep,1e-4):Math.min(8*MAT.tau_f,4e-3);
+function reset(){
+  recompute();
+  n2=0;phi=0;t=0;avgPG=0;pHeat=0;y1=0;y2=0;
+  switchClosed=true;tOpened=0;manualFire=false;slowmoUntil=-1;
+  tLastOpen=2*MAT.tau_f-1/rep;
+  pulseCap=null;lastPulse=null;pulseCount=0;totalE=0;
+  samples=[];nextSampleT=0;
+  modeCache=modeParams(fTh());
+}
+function computeRIN(){
+  const n=Math.min(samples.length,200);
+  if(n<20)return 0;
+  let m=0;for(let i=samples.length-n;i<samples.length;i++)m+=samples[i].pg;
+  m/=n;if(m<1e-6)return 0;
+  let v=0;for(let i=samples.length-n;i<samples.length;i++)v+=Math.pow(samples[i].pg-m,2);
+  return Math.sqrt(v/n)/m*100;
+}
+function label(s,x,y,c='#8fa3c8',f='12px system-ui',al='left'){
+  ctx.fillStyle=c;ctx.font=f;ctx.textAlign=al;ctx.fillText(s,x,y);ctx.textAlign='left';}
+function panel(x,y,w,h){ctx.fillStyle='rgba(20,26,40,.75)';ctx.strokeStyle='#2c3a55';
+  ctx.lineWidth=1.5;ctx.beginPath();ctx.roundRect(x,y,w,h,10);ctx.fill();ctx.stroke();}
+function fmt(x,u){
+  if(!isFinite(x)||x===0)return'0 '+u;
+  const a=Math.abs(x),p=[['G',1e9],['M',1e6],['k',1e3],['',1],['m',1e-3],['µ',1e-6],['n',1e-9],['p',1e-12]];
+  for(const[q,f]of p)if(a>=f)return(x/f).toPrecision(3)+' '+q+u;
+  return(x*1e15).toPrecision(3)+' f'+u;}
+function arrow(x1,y1,x2,y2,col,alpha,lab){
+  ctx.globalAlpha=Math.max(.25,Math.min(1,alpha));
+  ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+  const ang=Math.atan2(y2-y1,x2-x1),s=7;
+  ctx.beginPath();ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-s*Math.cos(ang-.5),y2-s*Math.sin(ang-.5));
+  ctx.lineTo(x2-s*Math.cos(ang+.5),y2-s*Math.sin(ang+.5));ctx.closePath();ctx.fill();
+  if(lab){ctx.font='10px system-ui';ctx.fillText(lab,x1+5,(y1+y2)/2);}
+  ctx.globalAlpha=1;}
+function wavy(x1,y1,x2,y2,col,alpha,lab){
+  ctx.globalAlpha=Math.max(.25,Math.min(1,alpha));
+  ctx.strokeStyle=col;ctx.lineWidth=1.8;ctx.beginPath();
+  for(let i=0;i<=12;i++){const t=i/12,yy=y1+(y2-y1)*t,xx=x1+Math.sin(t*Math.PI*4)*5;
+    i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);}
+  ctx.stroke();
+  if(lab){ctx.fillStyle=col;ctx.font='10px system-ui';ctx.fillText(lab,x1+7,(y1+y2)/2);}
+  ctx.globalAlpha=1;}
+
+function drawBench(){
+  ctx.strokeStyle='rgba(90,110,140,.28)';ctx.setLineDash([5,6]);
+  ctx.beginPath();ctx.moveTo(24,AXIS);ctx.lineTo(1156,AXIS);ctx.stroke();ctx.setLineDash([]);
+  ctx.fillStyle='rgba(140,70,70,.06)';ctx.fillRect(240,AXIS-74,320,148);
+  label('оптический резонатор 1064 нм',400,AXIS-84,'#5a6c8f','11px system-ui','center');
+}
+function drawMode(){
+  const mc=modeCache,sc=0.35;
+  if(!mc.stable){
+    ctx.fillStyle='rgba(255,80,60,.10)';ctx.fillRect(240,AXIS-70,320,140);
+    label('НЕУСТОЙЧИВО — большие потери',400,AXIS,'#ff8a70','12px system-ui','center');
+    return;
+  }
+  const xs=[240,310,450,560];
+  const ws=[Math.min(mc.wc*1.15,300e-6),mc.wc,mc.wk,mc.wo];
+  const lp=Math.max(0,Math.min(1,Math.log10(phi+1)/13));
+  ctx.beginPath();
+  for(let i=0;i<4;i++){const y=AXIS-ws[i]*sc;i?ctx.lineTo(xs[i],y):ctx.moveTo(xs[i],y);}
+  for(let i=3;i>=0;i--)ctx.lineTo(xs[i],AXIS+ws[i]*sc);
+  ctx.closePath();
+  ctx.fillStyle=`rgba(255,70,60,${0.05+0.4*lp})`;ctx.fill();
+  ctx.strokeStyle='rgba(255,120,100,.35)';ctx.lineWidth=1;ctx.stroke();
+}
+function drawLD(){
+  const nf=noiseFactor();
+  const g=Ppump/0.8*Math.max(0.15, nf);
+  const a0=Math.max(0, Math.min(0.6, isFinite(g)?0.45*g:0.2));
+  const gr=ctx.createLinearGradient(118,0,200,0);
+  gr.addColorStop(0,`rgba(180,140,255,${a0})`);
+  gr.addColorStop(1,'rgba(180,140,255,0)');
+  ctx.fillStyle=gr;ctx.fillRect(118,AXIS-10,82,20);
+  ctx.fillStyle='#232b3f';ctx.strokeStyle='#4a5a7a';ctx.lineWidth=1.5;
+  ctx.beginPath();ctx.roundRect(40,AXIS-22,72,44,7);ctx.fill();ctx.stroke();
+  const a1=Math.max(0, Math.min(1, isFinite(g)?0.35+0.6*g:0.5));
+  ctx.fillStyle=`rgba(180,140,255,${a1})`;ctx.fillRect(110,AXIS-9,7,18);
+  ctx.strokeStyle='#6d84a8';ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(66,AXIS-22);ctx.lineTo(66,AXIS-34);
+  ctx.moveTo(86,AXIS+22);ctx.lineTo(86,AXIS+34);ctx.stroke();
+  label('ЛД 808 нм',40,AXIS+100,'#cdd9ee');
+  if(noiseAmp>0.02)label('~шум тока',40,AXIS+114,'#b9a8ff','10px system-ui');
+}
+function drawPumpRays(){
+  const g=Ppump/0.8,ec=etaCoup();
+  const lx=162,ly=AXIS+lens.off,fx=310,fy=AXIS+lens.off*2.2;
+  ctx.strokeStyle=`rgba(180,140,255,${(0.12+0.45*g)*Math.max(0.12,ec)})`;
+  ctx.lineWidth=1.4;
+  for(const s of[-1,0,1]){
+    ctx.beginPath();ctx.moveTo(114,AXIS+s*8);ctx.lineTo(lx,ly+s*16);
+    ctx.lineTo(fx,fy+s*2.5);ctx.stroke();
+  }
+  ctx.fillStyle=`rgba(180,140,255,${0.4*g*Math.max(0.1,ec)})`;
+  ctx.beginPath();ctx.arc(fx,fy,5,0,7);ctx.fill();
+}
+function drawLens(){
+  const ly=AXIS+lens.off;
+  if(Math.abs(lens.off)>2){
+    ctx.strokeStyle='rgba(127,160,200,.35)';ctx.setLineDash([4,4]);ctx.lineWidth=1.2;
+    ctx.beginPath();ctx.ellipse(162,AXIS,9,44,0,0,7);ctx.stroke();ctx.setLineDash([]);
+  }
+  ctx.fillStyle='rgba(140,180,230,.28)';
+  ctx.strokeStyle=(dragIt===lens||hoverIt===lens)?'#ffd76a':'#7fa0c8';
+  ctx.lineWidth=1.6;
+  ctx.beginPath();ctx.ellipse(162,ly,9,44,0,0,7);ctx.fill();ctx.stroke();
+  label('Линза',146,AXIS+100,'#cdd9ee');
+  if(Math.abs(lens.off)>2)label('Δy='+lens.off.toFixed(0),146,AXIS+114,'#ffb14a','10px system-ui');
+}
+function drawMirrors(){
+  let g1=ctx.createLinearGradient(228,0,240,0);
+  g1.addColorStop(0,'#39445e');g1.addColorStop(1,'#d5e2f5');
+  ctx.fillStyle=g1;ctx.fillRect(228,AXIS-72,12,144);
+  g1=ctx.createLinearGradient(560,0,572,0);
+  g1.addColorStop(0,'rgba(213,226,245,.95)');g1.addColorStop(1,'rgba(213,226,245,.35)');
+  ctx.fillStyle=g1;ctx.fillRect(560,AXIS-72,12,144);
+  label('HR',222,AXIS+100,'#cdd9ee');label('R(1064)≈100%',206,AXIS+114,'#7f90ad','10px system-ui');
+  label('OC R=0.12 м',540,AXIS+100,'#cdd9ee');label('R(1064)≈90%',548,AXIS+114,'#7f90ad','10px system-ui');
+}
+function drawNd(){
+  const heat=Math.max(0, Math.min(1, isFinite(pHeat)?pHeat/0.2:0));
+  ctx.fillStyle=`rgba(${150+100*heat|0},${120-40*heat|0},${200-120*heat|0},.16)`;
+  ctx.fillRect(268,AXIS-42,84,84);
+  ctx.strokeStyle='#3a4a6a';ctx.lineWidth=1.5;ctx.strokeRect(268,AXIS-42,84,84);
+  const frac=Math.max(0,Math.min(1,n2/MAT.N_total));
+  for(let i=0;i<48;i++){
+    const ax=276+(i%8)*10,ay=AXIS-34+((i/8)|0)*10;
+    const exc=(i+0.5)/48<frac;
+    if(exc){ctx.fillStyle='rgba(125,255,125,.16)';
+      ctx.beginPath();ctx.arc(ax,ay,8,0,7);ctx.fill();}
+    ctx.fillStyle=exc?'#7dff7d':'#6d84a8';
+    ctx.beginPath();ctx.arc(ax,ay,3.6,0,7);ctx.fill();
+  }
+  label('Nd:YAG',284,AXIS+100,'#cdd9ee');
+  label('нагрев: '+fmt(pHeat,'Вт'),268,AXIS+114,heat>0.5?'#ffb14a':'#7f90ad','10px system-ui');
+}
+function drawKTP(){
+  const ky=AXIS+ktpE.off;
+  if(Math.abs(ktpE.off)>2){
+    ctx.strokeStyle='rgba(160,96,144,.4)';ctx.setLineDash([4,4]);ctx.lineWidth=1.2;
+    ctx.strokeRect(410,AXIS-36,80,72);ctx.setLineDash([]);
+  }
+  ctx.fillStyle='rgba(255,110,170,.13)';ctx.fillRect(410,ky-36,80,72);
+  const cg=Math.max(0,Math.min(.5,Math.log10(Pgreen()+1)/6));
+  if(cg>0.01){ctx.fillStyle=`rgba(120,255,150,${cg})`;ctx.fillRect(410,AXIS-10,80,20);}
+  ctx.strokeStyle=(dragIt===ktpE||hoverIt===ktpE)?'#ffd76a':'#a06090';
+  ctx.lineWidth=1.6;ctx.strokeRect(410,ky-36,80,72);
+  label('KTP (SHG)',424,AXIS+100,'#cdd9ee');
+  label('синхронизм '+Math.round(pmFac()*100)+'% · η '+Math.round(etaKtp()*100)+'%',
+        410,AXIS+114,pmFac()*etaKtp()>0.5?'#7dffa9':'#ff8a70','10px system-ui');
+  if(Math.abs(ktpE.off)>2)label('Δy='+ktpE.off.toFixed(0),424,AXIS+128,'#ffb14a','10px system-ui');
+}
+function drawQS(){
+  const closed=(mode==='qswitch'&&switchClosed);
+  ctx.fillStyle=mode!=='qswitch'?'rgba(90,100,120,.25)':
+    closed?'rgba(255,90,60,.8)':'rgba(90,220,140,.35)';
+  ctx.fillRect(512,AXIS-34,26,68);
+  ctx.strokeStyle='#4a5a7a';ctx.lineWidth=1.2;ctx.strokeRect(512,AXIS-34,26,68);
+  label('Q-затвор',503,AXIS+100,'#cdd9ee');
+  if(mode==='qswitch')
+    label(closed?'закрыт':'ОТКРЫТ',506,AXIS+114,closed?'#ff8a70':'#7dffa9','10px system-ui');
+}
+function drawFilter(){
+  ctx.save();ctx.translate(645,AXIS);ctx.rotate(0.10);
+  ctx.fillStyle='rgba(96,150,255,.30)';ctx.strokeStyle='#7fa0ff';ctx.lineWidth=1.5;
+  ctx.fillRect(-5,-64,10,128);ctx.strokeRect(-5,-64,10,128);
+  ctx.restore();
+  const pl=Pleak();
+  if(pl>0.02){ctx.fillStyle=`rgba(255,150,60,${Math.min(.6,Math.log10(pl+1)*.5)})`;
+    ctx.beginPath();ctx.arc(645,AXIS,12,0,7);ctx.fill();}
+  label('ИК-фильтр',620,AXIS+100,'#cdd9ee');
+  label('ИК→тепло: '+fmt(pl,'Вт'),600,AXIS+114,'#7f90ad','10px system-ui');
+}
+function drawOutput(){
+  const pg=Pgreen();
+  const b=Math.max(0,Math.min(1,Math.log10(pg*1e3+1)/5));
+  if(b>0.02){
+    const g=ctx.createLinearGradient(655,0,1156,0);
+    g.addColorStop(0,`rgba(82,255,125,${.85*b})`);g.addColorStop(1,'rgba(82,255,125,0)');
+    const bh=3+26*b;
+    ctx.fillStyle=g;ctx.fillRect(655,AXIS-bh/2,501,bh);
+  }
+  label('Выход 532 нм: '+fmt(avgPG,'Вт'),700,AXIS-46,'#52ff7d','13px system-ui');
+}
+function drawLevels(){
+  panel(20,360,280,328);
+  label('Ионы Nd³⁺ — 4 уровня',36,382,'#cfdaf0','13px system-ui');
+  const L=[{y:412,lab:'полоса накачки',s:'p'},{y:470,lab:'⁴F₃/₂ метастабильный',s:2},
+           {y:560,lab:'нижний лазерный',s:'l'},{y:642,lab:'⁴I₉/₂ основной',s:'g'}];
+  const x0=36,x1=190,f2=n2/MAT.N_total;
+  const fr={p:0,2:f2,l:0,g:1-f2};
+  for(const lv of L){
+    ctx.strokeStyle='#5a6c8f';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(x0,lv.y);ctx.lineTo(x1,lv.y);ctx.stroke();
+    label(lv.lab,x0,lv.y-6,'#93a5c6','10px system-ui');
+    ctx.fillStyle=lv.s===2?'rgba(125,255,125,.85)':'rgba(143,180,232,.85)';
+    ctx.fillRect(x0,lv.y-4,(x1-x0)*fr[lv.s],4);
+    label((fr[lv.s]*100).toFixed(1)+'%',x1+8,lv.y+4,'#dfe6f3','11px system-ui');
+  }
+  const pumpA=Math.min(1,Wp0cur()/Wp0max*1.1);
+  const lasA=Math.min(1,Math.log10(phi+1)/12);
+  arrow(52,L[3].y,52,L[0].y,'#b48cff',pumpA,'808');
+  wavy(96,L[0].y,96,L[1].y,'#ffb14a',pumpA,'τ≈нс');
+  arrow(140,L[1].y,140,L[2].y,'#ff5050',lasA,'1064');
+  arrow(176,L[2].y,176,L[3].y,'#7fd0ff',lasA,'быстрый');
+  label('яркость стрелок ∝ скорости процессов',36,678,'#5a6c8f','10px system-ui');
+}
+function drawPM(){
+  panel(316,360,284,110);
+  label('Фазовый синхронизм KTP: sinc²(ΔkL/2)',330,378,'#cfdaf0','12px system-ui');
+  const px=330,py=390,pw=256,ph=52;
+  ctx.strokeStyle='#22304a';ctx.beginPath();ctx.moveTo(px,py+ph);ctx.lineTo(px+pw,py+ph);ctx.stroke();
+  ctx.strokeStyle='#ffdf3f';ctx.lineWidth=1.5;ctx.beginPath();
+  for(let i=0;i<=100;i++){
+    const dT=-18+i*36/100,x=dT*0.30,pm=Math.abs(x)<1e-9?1:Math.pow(Math.sin(x)/x,2);
+    const X=px+i/100*pw,Y=py+ph-pm*ph;
+    i?ctx.lineTo(X,Y):ctx.moveTo(X,Y);
+  }
+  ctx.stroke();
+  const dT=(tempVal-50)*0.36,xm=dT*0.30,pmv=Math.abs(xm)<1e-9?1:Math.pow(Math.sin(xm)/xm,2);
+  ctx.fillStyle='#ffdf3f';ctx.beginPath();
+  ctx.arc(px+(dT+18)/36*pw,py+ph-pmv*ph,3.5,0,7);ctx.fill();
+  label('ΔT='+(dT>=0?'+':'')+dT.toFixed(1)+'°C · эфф. '+Math.round(pmv*100)+'%',
+        330,460,pmv>0.5?'#7dffa9':'#ff8a70','11px system-ui');
+}
+function drawThermal(){
+  panel(316,484,284,110);
+  label('Термолинза и устойчивость резонатора',330,502,'#cfdaf0','12px system-ui');
+  const fth=fTh();
+  label('f_линзы: '+(fth>=59?'≈∞':fmt(fth,'м'))+'   s = '+modeCache.s.toFixed(2)+
+        (modeCache.stable?' (стаб.)':' (НЕСТАБ.)'),330,518,
+        modeCache.stable?'#9fb2d4':'#ff8a70','11px system-ui');
+  const px=330,py=528,pw=256,ph=44;
+  ctx.strokeStyle='#22304a';ctx.strokeRect(px,py,pw,ph);
+  const sMin=-0.5,sMax=1.05;
+  const Y=s=>py+ph-Math.max(0,Math.min(1,(s-sMin)/(sMax-sMin)))*ph;
+  ctx.strokeStyle='rgba(255,255,255,.18)';ctx.beginPath();
+  ctx.moveTo(px,Y(0));ctx.lineTo(px+pw,Y(0));ctx.stroke();
+  let prev=null;
+  for(let i=0;i<=60;i++){
+    const P=i/60*0.8,ph_=HEAT_FRAC*ETA_ABS*P;
+    const f=Math.min(F0_TH/Math.max(ph_,2e-4),60);
+    const s=modeParams(f).s,X=px+i/60*pw,Yv=Y(s);
+    if(prev){ctx.strokeStyle=prev.s>0&&s>0?'#7dffa9':'#ff8a70';
+      ctx.lineWidth=1.4;ctx.beginPath();ctx.moveTo(prev.X,prev.Y);ctx.lineTo(X,Yv);ctx.stroke();}
+    prev={X,Y:Yv,s};
+  }
+  const mx=px+Ppump/0.8*pw;
+  ctx.strokeStyle='#fff';ctx.beginPath();ctx.moveTo(mx,py);ctx.lineTo(mx,py+ph);ctx.stroke();
+  label('w(Nd)='+Math.round(modeCache.wc*1e6)+' мкм, w(KTP)='+Math.round(modeCache.wk*1e6)+
+        ' мкм · кривая: s(P_накачки)',330,586,'#5a6c8f','10px system-ui');
+}
+function miniBar(x,y,w,v,lab,col){
+  v=Math.max(0,Math.min(1,v));
+  ctx.fillStyle='#141a28';ctx.fillRect(x,y,w,9);
+  ctx.strokeStyle='#33415c';ctx.lineWidth=1;ctx.strokeRect(x,y,w,9);
+  ctx.fillStyle=col;ctx.fillRect(x,y,w*v,9);
+  label(lab+' '+Math.round(v*100)+'%',x+w+8,y+8,'#9fb2d4','10px system-ui');
+}
+function drawAlignPanel(){
+  panel(316,608,284,80);
+  label('Юстировка — перетаскивайте мышью',330,626,'#cfdaf0','12px system-ui');
+  miniBar(330,636,140,etaCoup(),'линза (перекрытие накачки)','#b48cff');
+  miniBar(330,654,140,etaKtp(),'KTP (перекрытие моды)','#ff9ecf');
+  label('двойной клик — сброс смещений',330,678,'#5a6c8f','10px system-ui');
+}
+function plotG(px,py,pw,ph,get,norm,col){
+  if(samples.length<2)return;
+  const tw=graphWindow(),t0=t-tw;
+  ctx.strokeStyle=col;ctx.lineWidth=1.4;ctx.beginPath();
+  let first=true;
+  for(const s of samples){
+    if(s.t<t0)continue;
+    const x=px+(s.t-t0)/tw*pw;
+    const v=Math.max(0,Math.min(1,norm(get(s))));
+    const y=py+ph-v*ph;
+    first?ctx.moveTo(x,y):ctx.lineTo(x,y);first=false;
+  }
+  ctx.stroke();
+}
+function drawG1(){
+  panel(616,360,544,150);
+  label('Заселенность N₂(t) относительно порога (порог динамический — зависит от δ_стаб и юстировки)',
+        630,380,'#cfdaf0','11px system-ui');
+  const px=630,py=392,pw=516,ph=100;
+  let ymax=1.6;for(const s of samples)ymax=Math.max(ymax,s.n2/thNow*1.1);
+  ctx.strokeStyle='#22304a';
+  for(let i=0;i<=3;i++){const y=py+ph*i/3;
+    ctx.beginPath();ctx.moveTo(px,y);ctx.lineTo(px+pw,y);ctx.stroke();}
+  const ythr=py+ph-(1/ymax)*ph;
+  ctx.strokeStyle='rgba(255,80,80,.6)';ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(px,ythr);ctx.lineTo(px+pw,ythr);ctx.stroke();ctx.setLineDash([]);
+  label('порог',px+pw-34,ythr-4,'#ff8080','10px system-ui');
+  plotG(px,py,pw,ph,s=>s.n2/thNow,v=>v/ymax,'#79f279');
+  label(fmt(graphWindow(),'с'),px+pw-52,py+ph+12,'#5a6c8f','10px system-ui');
+}
+function drawG2(){
+  panel(616,524,544,164);
+  label('Мощности (лог. шкала): 1064 циркулирующая и 532 выход — виден «green noise»',
+        630,544,'#cfdaf0','11px system-ui');
+  const px=630,py=556,pw=516,ph=100;
+  let pmax=1e-2;for(const s of samples)pmax=Math.max(pmax,s.pg,s.pc);
+  const lmin=-4,lmax=Math.max(-1,Math.log10(pmax*3));
+  const norm=v=>(Math.log10(Math.max(v,Math.pow(10,lmin)))-lmin)/(lmax-lmin);
+  ctx.strokeStyle='#22304a';
+  for(let e=Math.ceil(lmin);e<=Math.floor(lmax);e++){
+    const y=py+ph-(e-lmin)/(lmax-lmin)*ph;
+    ctx.beginPath();ctx.moveTo(px,y);ctx.lineTo(px+pw,y);ctx.stroke();
+    label('10^'+e,px+2,y-2,'#5a6c8f','9px system-ui');}
+  plotG(px,py,pw,ph,s=>s.pc,norm,'#ff5050');
+  plotG(px,py,pw,ph,s=>s.pg,norm,'#52ff7d');
+  ctx.fillStyle='#ff5050';ctx.fillRect(px+8,py+ph+8,14,3);
+  label('P цирк. 1064',px+26,py+ph+12,'#9fb2d4','10px system-ui');
+  ctx.fillStyle='#52ff7d';ctx.fillRect(px+150,py+ph+8,14,3);
+  label('P вых. 532',px+168,py+ph+12,'#9fb2d4','10px system-ui');
+  label(fmt(graphWindow(),'с'),px+pw-52,py+ph+12,'#5a6c8f','10px system-ui');
+}
+function draw(){
+  ctx.fillStyle='#05060a';ctx.fillRect(0,0,W,H);
+  drawBench();drawMode();drawLD();drawPumpRays();drawLens();
+  drawNd();drawKTP();drawQS();drawMirrors();drawFilter();drawOutput();
+  drawLevels();drawPM();drawThermal();drawAlignPanel();drawG1();drawG2();
+}
+const info=document.getElementById('info');
+function updateInfo(){
+  const P_th=(thNow/MAT.tau_f)*hvp*Vg/ETA_ABS/Math.max(etaCoup(),1e-6);
+  const rin=computeRIN();
+  let h=`
+  <span>Накачка: <b>${fmt(Ppump,'Вт')}</b> = <b>${(Ppump/Math.max(P_th,1e-12)).toFixed(2)}×</b> порога</span>
+  <span>Порог (динам.): <b>${fmt(P_th,'Вт')}</b></span>
+  <span>N₂/N_th: <b>${(n2/thNow).toFixed(2)}</b></span>
+  <span>Φ(1064): <b>${phi.toExponential(2)}</b></span>
+  <span>P цирк. 1064: <b>${fmt(Pcirc(),'Вт')}</b></span>
+  <span>P вых. 532: <b>${fmt(avgPG,'Вт')}</b></span>
+  <span>КПД 808→532: <b>${(100*avgPG/Math.max(Ppump,1e-9)).toFixed(1)}%</b> (предел 66%)</span>
+  <span>RIN 532: <b>${rin.toFixed(1)}%</b> (у ИК был бы ~вдвое меньше)</span>
+  <span>Термолинза: f=<b>${fTh()>=59?'∞':fmt(fTh(),'м')}</b>, P_тепл=<b>${fmt(pHeat,'Вт')}</b></span>
+  <span>Устойчивость: <b>${modeCache.stable?'стабилен':'НЕУСТОЙЧИВ'}</b> (s=${modeCache.s.toFixed(2)})</span>
+  <span>Мода: Nd <b>${Math.round(modeCache.wc*1e6)} мкм</b>, KTP <b>${Math.round(modeCache.wk*1e6)} мкм</b></span>
+  <span>Юстировка: линза <b>${Math.round(etaCoup()*100)}%</b>, KTP <b>${Math.round(etaKtp()*100)}%</b></span>`;
+  if(mode==='qswitch'){
+    h+=`<span>Импульсов: <b>${pulseCount}</b></span>`;
+    if(lastPulse)h+=`
+    <span>E зел. импульса: <b>${fmt(lastPulse.E,'Д')}</b></span>
+    <span>Пик P₅₃₂: <b>${fmt(lastPulse.peak,'Вт')}</b></span>
+    <span>FWHM: <b>${lastPulse.fwhm?fmt(lastPulse.fwhm,'с'):'—'}</b></span>`;
+  }
+  h+=`<span class="sub">dN₂/dt=R_p·η·ξ(t)−N₂/τ_f−G·N₂Φ/V_g;  dΦ/dt=[G·N₂−1/τ_c]Φ−κΦ²+βN₂V_g/τ_f;
+  f_th=F₀/P_heat, P_heat=0.3·η·P_нак (τ_th=40 мс);  устойчивость и w(z) — из ABCD-матриц;  ξ(t) — шум диода (OU);
+  P₅₃₂=κΦ²hν_g/2 — квадратичность удваивает относительный шум («green noise»).</span>`;
+  info.innerHTML=h;
+}
+function evtPos(e){const r=cv.getBoundingClientRect();
+  return{x:(e.clientX-r.left)*W/r.width,y:(e.clientY-r.top)*H/r.height};}
+cv.addEventListener('pointerdown',e=>{
+  const p=evtPos(e);
+  for(const it of[lens,ktpE]){
+    if(p.x>=it.x0&&p.x<=it.x1&&Math.abs(p.y-(AXIS+it.off))<=it.half){
+      dragIt=it;it.grab=p.y-(AXIS+it.off);
+      cv.setPointerCapture(e.pointerId);break;
+    }
+  }
+});
+cv.addEventListener('pointermove',e=>{
+  const p=evtPos(e);
+  if(dragIt){dragIt.off=Math.max(-55,Math.min(55,p.y-dragIt.grab-AXIS));return;}
+  hoverIt=null;
+  for(const it of[lens,ktpE])
+    if(p.x>=it.x0&&p.x<=it.x1&&Math.abs(p.y-(AXIS+it.off))<=it.half)hoverIt=it;
+  cv.style.cursor=hoverIt?'grab':'default';
+});
+addEventListener('pointerup',()=>{dragIt=null;});
+cv.addEventListener('dblclick',()=>{lens.off=0;ktpE.off=0;});
+const $=id=>document.getElementById(id);
+$('pump').oninput=e=>{Ppump=+e.target.value/1000;$('pv').textContent=e.target.value+' мВт';};
+$('noise').oninput=e=>{noiseAmp=+e.target.value/100*0.6;$('nv').textContent=e.target.value+'%';};
+$('mode').onchange=e=>{mode=e.target.value;
+  $('replab').style.display=mode==='qswitch'?'flex':'none';reset();};
+$('rep').oninput=e=>{rep=+e.target.value;$('repv').textContent=rep+' Гц';};
+$('temp').oninput=e=>{tempVal=+e.target.value;};
+$('fire').onclick=()=>{if(mode==='qswitch'&&switchClosed)manualFire=true;};
+$('slowmo').onchange=e=>autoSlow=e.target.checked;
+$('align').onclick=()=>{lens.off=0;ktpE.off=0;};
+$('pause').onclick=function(){paused=!paused;this.textContent=paused?'Продолжить':'Пауза';};
+$('reset').onclick=reset;
+$('pv').textContent='350 мВт';$('nv').textContent='25%';$('repv').textContent=rep+' Гц';
+
+reset();
+(function frame(){
+  if(!paused){
+    const sp=+$('speed').value/100;
+    const base=Math.pow(10,-6.8+sp*4.6);
+    pulseActive=(phi>1e10||Pgreen()>0.5);
+    let target=base;
+    if(autoSlow){
+      if(pulseActive)target=SLOW_SIM;
+      else if(t<slowmoUntil)target=Math.max(SLOW_SIM*20,base*0.02);
+    }
+    curSpeed+=(target-curSpeed)*(target<curSpeed?0.5:0.12);
+    modeCache=modeParams(fTh());
+    thNow=(dPass0+dAlign()+dStab())/(2*GEO.L_g)/MAT.sigma;
+    t_sample=graphWindow()/400;
+    advance(curSpeed);
+  }
+  draw();updateInfo();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>D-браны, гравитоны, чёрная дыра и струнные взаимодействия</title>
+<style>
+ body{background:#0d0d14;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#05050a;border:1px solid #333;display:block;}
+ .controls{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:8px;}
+ .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;}
+ #info{margin-top:8px;font-size:13px;color:#bbb;}
+ label{font-size:14px;}
+</style>
+</head>
+<body>
+<h2>Струны: D-брана, gₛ-взаимодействия, гравитоны и чёрная дыра</h2>
+
+<div class="controls">
+ <label>gₛ: <input id="gs" type="range" min="0" max="1" step="0.01" value="0.55"> <span id="gsVal">0.55</span></label>
+ <label>скорость: <input id="speed" type="range" min="1" max="6" value="2"> <span id="speedVal">2</span></label>
+ <label><input id="braneChk" type="checkbox" checked> D-брана</label>
+ <label><input id="bhChk" type="checkbox" checked> чёрная дыра</label>
+ <button id="addStr">+ струна</button>
+ <button id="addGrav">+ гравитон</button>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+
+<canvas id="sim" width="900" height="520"></canvas>
+
+<div class="row">
+ <canvas id="pants" width="540" height="380"></canvas>
+ <div>
+  <canvas id="sheet" width="350" height="190"></canvas>
+  <div style="color:#888;font-size:12px;max-width:350px;">
+   слева — мировой лист «штаны» (вершина соединения), вращается мышью;
+   сверху — история струн (x, t): слияние полос = взаимодействие
+  </div>
+ </div>
+</div>
+
+<div id="info"></div>
+
+<script>
+"use strict";
+const sim=document.getElementById('sim'), ctx=sim.getContext('2d');
+const pants=document.getElementById('pants'), qctx=pants.getContext('2d');
+const sheet=document.getElementById('sheet'), hctx=sheet.getContext('2d');
+const sheetTmp=document.createElement('canvas');
+sheetTmp.width=350; sheetTmp.height=190;
+const tctx=sheetTmp.getContext('2d');
+const info=document.getElementById('info');
+
+const gsEl=document.getElementById('gs'), gsVal=document.getElementById('gsVal');
+const speedEl=document.getElementById('speed'), speedVal=document.getElementById('speedVal');
+const braneChk=document.getElementById('braneChk'), bhChk=document.getElementById('bhChk');
+const addStrBtn=document.getElementById('addStr'), addGravBtn=document.getElementById('addGrav');
+const pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+// ---------------- размеры и параметры ----------------
+const SW=900, SH=520;
+const PW=540, PH=380;
+const HW=350, HH=190;
+
+const TENS=0.25, DT=0.5, DAMP=0.9995;
+const R_JOIN=11, R_ATTR=110, K_ATTR=0.02;
+const KW=0.03, MARGIN=25, CD=40;
+const braneX=230;
+
+let gs=+gsEl.value, speed=+speedEl.value, running=true, tick=0;
+let braneOn=true, bhOn=true;
+
+let bh={x:SW-140, y:SH*0.5, mass:10, eaten:0, r:30};
+function bhRadius(){ return 20+2.6*Math.sqrt(bh.mass); }
+
+let strings=[], flashes=[];
+let joins=0,splits=0,recon=0,closes=0,gravEmitted=0,eaten=0;
+let nextId=1,colorIdx=0;
+const COLORS=['#7cff7c','#ff6ec7','#c9a7ff','#7fd4ff','#ff7b72','#9be15d'];
+const BRANE_COLORS=['#00e5ff','#ff9f43','#c9a7ff','#7fd4ff'];
+let braneColorIdx=0;
+function pickColor(){ return COLORS[(colorIdx++)%COLORS.length]; }
+function pickBraneColor(){ return BRANE_COLORS[(braneColorIdx++)%BRANE_COLORS.length]; }
+function dist(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+function center(s){
+ let x=0,y=0;
+ for(const p of s.pts){x+=p.x;y+=p.y;}
+ return {x:x/s.pts.length, y:y/s.pts.length};
+}
+
+// ---------------- создание струн ----------------
+function makeBraneString(cy,len,mode,vamp){
+ const n=64, pts=[];
+ for(let i=0;i<n;i++){
+  const t=i/(n-1);
+  const y=cy-len/2+len*t;
+  const x=braneX+(58+8*mode)*Math.sin(Math.PI*t);
+  pts.push({x,y,vx:0,vy:vamp*Math.sin(mode*Math.PI*t)});
+ }
+ return {pts,closed:false,onBrane:true,grav:false,color:pickBraneColor(),cd:0,id:nextId++};
+}
+
+function makeOpen(cx,cy,len,ang,mode,amp,vx,vy,color){
+ const n=64, pts=[];
+ const dx=Math.cos(ang), dy=Math.sin(ang), tx=-dy, ty=dx;
+ for(let i=0;i<n;i++){
+  const s=(i/(n-1)-0.5)*len;
+  const d=amp*Math.sin(mode*Math.PI*i/(n-1));
+  pts.push({x:cx+dx*s+tx*d, y:cy+dy*s+ty*d, vx, vy});
+ }
+ return {pts,closed:false,onBrane:false,grav:false,color:color||pickColor(),cd:0,id:nextId++};
+}
+
+function makeGraviton(x,y,vx,vy){
+ const n=22, r=12, pts=[];
+ for(let i=0;i<n;i++){
+  const a=i/n*2*Math.PI;
+  pts.push({x:x+r*Math.cos(a), y:y+r*Math.sin(a), vx, vy});
+ }
+ return {pts,closed:true,onBrane:false,grav:true,color:'#ffe066',cd:0,id:nextId++};
+}
+
+function spawnScene(){
+ strings.push(makeBraneString(SH*0.30,150,2,0.8));
+ strings.push(makeBraneString(SH*0.62,170,3,0.8));
+ strings.push(makeGraviton(520,130,0.2,0.1));
+}
+
+function reset(){
+ strings=[]; flashes=[];
+ joins=splits=recon=closes=gravEmitted=eaten=0;
+ nextId=1; colorIdx=0; braneColorIdx=0;
+ bh={x:SW-140,y:SH*0.5,mass:10,eaten:0,r:bhRadius()};
+ spawnScene();
+ hctx.fillStyle='#05050a'; hctx.fillRect(0,0,HW,HH);
+}
+
+// ---------------- физика ----------------
+function wallFx(x){ if(x<MARGIN)return KW*(MARGIN-x); if(x>SW-MARGIN)return KW*(SW-MARGIN-x); return 0; }
+function wallFy(y){ if(y<MARGIN)return KW*(MARGIN-y); if(y>SH-MARGIN)return KW*(SH-MARGIN-y); return 0; }
+
+function physStep(){
+ // натяжение
+ for(const s of strings){
+  const P=s.pts, n=P.length;
+  const ax=new Array(n), ay=new Array(n);
+  for(let i=0;i<n;i++){
+   let axx=0,ayy=0;
+   if(s.closed){
+    const im=(i-1+n)%n, ip=(i+1)%n;
+    axx=TENS*(P[ip].x+P[im].x-2*P[i].x);
+    ayy=TENS*(P[ip].y+P[im].y-2*P[i].y);
+   } else if(i===0){
+    axx=2*TENS*(P[1].x-P[0].x); ayy=2*TENS*(P[1].y-P[0].y);
+   } else if(i===n-1){
+    axx=2*TENS*(P[n-2].x-P[n-1].x); ayy=2*TENS*(P[n-2].y-P[n-1].y);
+   } else {
+    axx=TENS*(P[i+1].x+P[i-1].x-2*P[i].x);
+    ayy=TENS*(P[i+1].y+P[i-1].y-2*P[i].y);
+   }
+   ax[i]=axx; ay[i]=ayy;
+  }
+  for(let i=0;i<n;i++){
+   P[i].vx=(P[i].vx+ax[i]*DT)*DAMP;
+   P[i].vy=(P[i].vy+ay[i]*DT)*DAMP;
+  }
+ }
+
+ // притяжение концов открытых струн
+ const open=strings.filter(s=>!s.closed);
+ for(let a=0;a<open.length;a++)for(let b=a+1;b<open.length;b++){
+  const A=open[a].pts, B=open[b].pts;
+  const ends=[[A[0],B[0]],[A[0],B[B.length-1]],[A[A.length-1],B[0]],[A[A.length-1],B[B.length-1]]];
+  for(const [pa,pb] of ends){
+   const d=dist(pa,pb);
+   if(d<R_ATTR&&d>0.01){
+    const f=K_ATTR*(1-d/R_ATTR)/d;
+    const fx=f*(pb.x-pa.x)*DT, fy=f*(pb.y-pa.y)*DT;
+    pa.vx+=fx; pa.vy+=fy; pb.vx-=fx; pb.vy-=fy;
+   }
+  }
+ }
+
+ // гравитоны притягивают всё
+ const gravs=strings.filter(s=>s.grav);
+ for(const g of gravs){
+  const c=center(g);
+  for(const s of strings){
+   if(s===g)continue;
+   for(const p of s.pts){
+    const dx=c.x-p.x, dy=c.y-p.y;
+    const f=65/(dx*dx+dy*dy+250);
+    p.vx+=f*dx*DT; p.vy+=f*dy*DT;
+   }
+  }
+ }
+
+ // чёрная дыра притягивает
+ if(bhOn){
+  for(const s of strings)for(const p of s.pts){
+   const dx=bh.x-p.x, dy=bh.y-p.y;
+   const f=bh.mass*0.12/(dx*dx+dy*dy+500);
+   p.vx+=f*dx*DT; p.vy+=f*dy*DT;
+  }
+ }
+
+ // стены, интеграция, закрепление на бране
+ for(const s of strings){
+  for(const p of s.pts){
+   p.vx+=wallFx(p.x)*DT; p.vy+=wallFy(p.y)*DT;
+   p.x+=p.vx*DT; p.y+=p.vy*DT;
+  }
+  if(braneOn&&s.onBrane){
+   const P=s.pts;
+   P[0].x=braneX; P[0].vx=0;
+   P[P.length-1].x=braneX; P[P.length-1].vx=0;
+  }
+  if(s.cd>0)s.cd--;
+ }
+}
+
+// ---------------- события (вероятность ~ gₛ) ----------------
+function segInt(p1,p2,p3,p4){
+ const d=(p2.x-p1.x)*(p4.y-p3.y)-(p2.y-p1.y)*(p4.x-p3.x);
+ if(Math.abs(d)<1e-9)return null;
+ const t=((p3.x-p1.x)*(p4.y-p3.y)-(p3.y-p1.y)*(p4.x-p3.x))/d;
+ const u=((p3.x-p1.x)*(p2.y-p1.y)-(p3.y-p1.y)*(p2.x-p1.x))/d;
+ if(t>0.02&&t<0.98&&u>0.02&&u<0.98)
+  return {x:p1.x+t*(p2.x-p1.x), y:p1.y+t*(p2.y-p1.y)};
+ return null;
+}
+function flash(x,y,color){ flashes.push({x,y,color,age:0}); }
+
+function tryJoin(){
+ const open=strings.filter(s=>!s.closed&&s.cd===0);
+ for(let i=0;i<open.length;i++)for(let j=i+1;j<open.length;j++){
+  const A=open[i], B=open[j];
+  const cand=[[0,0],[0,B.pts.length-1],[A.pts.length-1,0],[A.pts.length-1,B.pts.length-1]];
+  for(const [ia,ib] of cand){
+   const pa=A.pts[ia], pb=B.pts[ib];
+   if(dist(pa,pb)<R_JOIN){
+    if(Math.random()>gs){ A.cd=18; B.cd=18; return false; }
+    let ap=A.pts.slice(), bp=B.pts.slice();
+    if(ia===0)ap.reverse();
+    if(ib===B.pts.length-1)bp.reverse();
+    strings=strings.filter(s=>s!==A&&s!==B);
+    strings.push({pts:ap.concat(bp),closed:false,onBrane:A.onBrane&&B.onBrane,grav:false,color:pickColor(),cd:CD,id:nextId++});
+    flash((pa.x+pb.x)/2,(pa.y+pb.y)/2,'#ffffff');
+    joins++;
+    // соединение струн может излучить гравитон в объём
+    if(Math.random()<0.6*gs){
+     strings.push(makeGraviton((pa.x+pb.x)/2,(pa.y+pb.y)/2,0.7,0));
+     gravEmitted++;
+    }
+    return true;
+   }
+  }
+ }
+ return false;
+}
+
+function tryClose(){
+ for(const s of strings){
+  if(s.closed||s.cd)continue;
+  const n=s.pts.length; if(n<12)continue;
+  const a=s.pts[0], b=s.pts[n-1];
+  if(dist(a,b)<R_JOIN){
+   if(Math.random()>gs){ s.cd=18; return false; }
+   s.pts[0]={x:(a.x+b.x)/2,y:(a.y+b.y)/2,vx:(a.vx+b.vx)/2,vy:(a.vy+b.vy)/2};
+   s.pts.pop();
+   s.closed=true; s.onBrane=false; s.cd=CD; closes++;
+   flash(s.pts[0].x,s.pts[0].y,s.color);
+   return true;
+  }
+ }
+ return false;
+}
+
+function tryIntercommute(){
+ const open=strings.filter(s=>!s.closed&&s.cd===0);
+ for(let i=0;i<open.length;i++)for(let j=i+1;j<open.length;j++){
+  const A=open[i], B=open[j], PA=A.pts, PB=B.pts;
+  for(let a=0;a<PA.length-1;a++)for(let b=0;b<PB.length-1;b++){
+   const hit=segInt(PA[a],PA[a+1],PB[b],PB[b+1]);
+   if(hit){
+    if(Math.random()>gs){ A.cd=18; B.cd=18; return false; }
+    const X={x:hit.x,y:hit.y,vx:(PA[a].vx+PB[b].vx)/2,vy:(PA[a].vy+PB[b].vy)/2};
+    const p1=PA.slice(0,a+1).concat([{x:X.x,y:X.y,vx:X.vx,vy:X.vy}]).concat(PB.slice(b+1));
+    const p2=PB.slice(0,b+1).concat([{x:X.x,y:X.y,vx:X.vx,vy:X.vy}]).concat(PA.slice(a+1));
+    if(p1.length<6||p2.length<6)return false;
+    strings=strings.filter(s=>s!==A&&s!==B);
+    strings.push({pts:p1,closed:false,onBrane:false,grav:false,color:A.color,cd:CD,id:nextId++});
+    strings.push({pts:p2,closed:false,onBrane:false,grav:false,color:B.color,cd:CD,id:nextId++});
+    flash(hit.x,hit.y,'#ffffff'); recon++; return true;
+   }
+  }
+ }
+ return false;
+}
+
+function makeChild(pts,closed,X,sign,onBrane){
+ for(const p of pts){
+  const dx=p.x-X.x, dy=p.y-X.y, d=Math.hypot(dx,dy)||1;
+  p.vx+=sign*1.1*dx/d; p.vy+=sign*1.1*dy/d;
+ }
+ const child={pts,closed,onBrane:onBrane&&!closed,grav:false,color:pickColor(),cd:CD,id:nextId++};
+ if(closed&&pts.length<28&&Math.random()<0.5){
+  child.grav=true; child.color='#ffe066'; gravEmitted++;
+ }
+ strings.push(child);
+}
+
+function trySelfSplit(){
+ for(const s of strings){
+  if(s.cd)continue;
+  const P=s.pts, n=P.length;
+  if(n<16)continue;
+  const e=s.closed?n:n-1;
+  for(let i=0;i<e;i++)for(let j=i+1;j<e;j++){
+   const gap=j-i;
+   if(s.closed){ if(gap<6||n-gap<6)continue; }
+   else { if(gap<6)continue; if(n-gap+1<6)continue; }
+   const hit=segInt(P[i],P[(i+1)%n],P[j],P[(j+1)%n]);
+   if(hit){
+    if(Math.random()>gs){ s.cd=18; return false; }
+    if(s.closed){
+     makeChild(P.slice(i,j+1),true,hit,+1,false);
+     makeChild(P.slice(j+1).concat(P.slice(0,i+1)),true,hit,-1,false);
+    } else {
+     makeChild(P.slice(i,j+1),true,hit,+1,false);
+     makeChild(P.slice(j).concat(P.slice(0,i+1)),false,hit,-1,s.onBrane);
+    }
+    strings=strings.filter(x=>x!==s);
+    flash(hit.x,hit.y,'#ffffff'); splits++; return true;
+   }
+  }
+ }
+ return false;
+}
+
+function interactions(){
+ let did=0;
+ while(did<2){
+  if(tryJoin()){did++;continue;}
+  if(tryClose()){did++;continue;}
+  if(tryIntercommute()){did++;continue;}
+  if(trySelfSplit()){did++;continue;}
+  break;
+ }
+}
+
+function absorbCheck(){
+ if(!bhOn)return;
+ for(let i=strings.length-1;i>=0;i--){
+  const s=strings[i];
+  for(const p of s.pts){
+   if(Math.hypot(p.x-bh.x,p.y-bh.y)<bh.r){
+    strings.splice(i,1);
+    bh.mass+=s.grav?2.5:1;
+    bh.eaten++; eaten++;
+    bh.r=bhRadius();
+    flash(bh.x,bh.y,'#ffb060');
+    break;
+   }
+  }
+ }
+}
+
+// ---------------- отрисовка симуляции ----------------
+function drawSim(){
+ ctx.fillStyle='#05050a'; ctx.fillRect(0,0,SW,SH);
+
+ // вспышки
+ for(let k=flashes.length-1;k>=0;k--){
+  const f=flashes[k]; f.age++;
+  if(f.age>25){flashes.splice(k,1);continue;}
+  ctx.globalAlpha=1-f.age/25;
+  ctx.strokeStyle=f.color; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(f.x,f.y,f.age*3,0,Math.PI*2); ctx.stroke();
+  ctx.globalAlpha=1;
+ }
+
+ // D-брана
+ if(braneOn){
+  ctx.save();
+  ctx.strokeStyle='rgba(120,200,255,0.9)';
+  ctx.lineWidth=3; ctx.shadowColor='#6cf'; ctx.shadowBlur=12;
+  ctx.beginPath(); ctx.moveTo(braneX,10); ctx.lineTo(braneX,SH-10); ctx.stroke();
+  ctx.restore();
+  ctx.fillStyle='#8cd0ff'; ctx.font='12px system-ui';
+  ctx.fillText('D-брана (концы закреплены)',braneX+8,20);
+ }
+
+ // чёрная дыра
+ if(bhOn){
+  const g=ctx.createRadialGradient(bh.x,bh.y,bh.r*0.4,bh.x,bh.y,bh.r*2.2);
+  g.addColorStop(0,'rgba(255,150,60,0.22)');
+  g.addColorStop(1,'rgba(255,150,60,0)');
+  ctx.fillStyle=g;
+  ctx.beginPath(); ctx.arc(bh.x,bh.y,bh.r*2.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#000';
+  ctx.beginPath(); ctx.arc(bh.x,bh.y,bh.r,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='rgba(255,190,90,0.95)'; ctx.lineWidth=2.5;
+  ctx.beginPath(); ctx.arc(bh.x,bh.y,bh.r+1.5,0,Math.PI*2); ctx.stroke();
+  ctx.fillStyle='#f0b070'; ctx.font='12px system-ui';
+  ctx.fillText(`чёрная дыра · M=${bh.mass.toFixed(1)} · съедено: ${bh.eaten}`,bh.x-70,bh.y+bh.r+18);
+ }
+
+ // струны
+ for(const s of strings){
+  const pulse=s.grav?1+0.12*Math.sin(tick*0.15+s.id):1;
+  ctx.strokeStyle=s.color; ctx.lineWidth=s.grav?3:2.5;
+  ctx.shadowColor=s.color; ctx.shadowBlur=s.grav?16:9;
+  ctx.beginPath();
+  for(let i=0;i<s.pts.length;i++){
+   const p=s.pts[i];
+   const px=s.grav?center(s).x+(p.x-center(s).x)*pulse:p.x;
+   const py=s.grav?center(s).y+(p.y-center(s).y)*pulse:p.y;
+   i?ctx.lineTo(px,py):ctx.moveTo(px,py);
+  }
+  if(s.closed)ctx.closePath();
+  ctx.stroke();
+  ctx.shadowBlur=0;
+  if(!s.closed){
+   ctx.fillStyle='#fff';
+   for(const p of [s.pts[0],s.pts[s.pts.length-1]]){
+    ctx.beginPath(); ctx.arc(p.x,p.y,3,0,Math.PI*2); ctx.fill();
+   }
+  }
+  if(s.grav){
+   const c=center(s);
+   ctx.fillStyle='#ffe066'; ctx.font='11px system-ui';
+   ctx.fillText('гравитон',c.x+16,c.y-14);
+  }
+ }
+
+ const open=strings.filter(s=>!s.closed).length;
+ info.textContent=
+  `струн: ${strings.length} (открытых ${open}, замкнутых ${strings.length-open}) | `+
+  `соединений: ${joins} | замыканий: ${closes} | реконнекций: ${recon} | распадов: ${splits} | `+
+  `гравитонов излучено: ${gravEmitted} | съедено ЧД: ${eaten} | gₛ=${gs.toFixed(2)}`;
+}
+
+// ---------------- история (x,t) ----------------
+function pushHistory(){
+ tctx.clearRect(0,0,HW,HH);
+ tctx.drawImage(sheet,0,0);
+ hctx.clearRect(0,0,HW,HH);
+ hctx.drawImage(sheetTmp,0,-1);
+ hctx.globalAlpha=0.9;
+ for(const s of strings){
+  hctx.fillStyle=s.color;
+  for(const p of s.pts){
+   hctx.fillRect(Math.floor(p.x/SW*HW), HH-1, 1, 1);
+  }
+ }
+ hctx.globalAlpha=1;
+}
+
+// ---------------- 3D «штаны» ----------------
+const PNT=46, PNM=72;
+let spin=0.7, tilt=-0.5, dragging=false, lx=0, ly=0;
+
+function crossSection(a,r,M){
+ const pts=[]; let prev=null, acc=0;
+ for(let k=0;k<=M;k++){
+  const ph=k/M*4*Math.PI;
+  const wr=a+r*Math.cos(ph), wi=r*Math.sin(ph);
+  const ang=Math.atan2(wi,wr);
+  if(prev===null)acc=ang;
+  else { let d=ang-prev; while(d>Math.PI)d-=2*Math.PI; while(d<-Math.PI)d+=2*Math.PI; acc+=d; }
+  prev=ang;
+  const m=Math.hypot(wr,wi), s=Math.sqrt(m), h=acc/2;
+  pts.push({u:s*Math.cos(h), v:s*Math.sin(h)});
+ }
+ return pts;
+}
+
+function drawPants(){
+ qctx.fillStyle='#050510'; qctx.fillRect(0,0,PW,PH);
+ if(!dragging)spin+=0.006;
+
+ const S=88, cx=PW/2, cy=PH/2+10;
+ const cs=Math.cos(spin), ss=Math.sin(spin);
+ const ct=Math.cos(tilt), st=Math.sin(tilt);
+
+ function proj(u,v,w){
+  const x1=u*cs-v*ss, y1=u*ss+v*cs;
+  const y2=y1*ct-w*st, z2=y1*st+w*ct;
+  return {x:cx+x1*S, y:cy-z2*S};
+ }
+
+ // срезы мирового листа
+ for(let it=0;it<=PNT;it++){
+  const tau=it/PNT;
+  const a=tau<0.5?1.25*(1-tau/0.5):-0.6*(tau-0.5)/0.5;
+  const r=0.34*(1+0.05*Math.sin(tau*14-tick*0.06));
+  const sec=crossSection(a,r,PNM);
+  const w=(tau-0.5)*1.25;
+  qctx.strokeStyle=tau<0.45?'rgba(110,217,255,0.35)':(tau<0.55?'rgba(255,212,59,0.4)':'rgba(124,255,124,0.35)');
+  qctx.lineWidth=1;
+  qctx.beginPath();
+  for(let k=0;k<=PNM;k++){
+   const p=proj(sec[k].u,sec[k].v,w);
+   k?qctx.lineTo(p.x,p.y):qctx.moveTo(p.x,p.y);
+  }
+  qctx.stroke();
+ }
+
+ // продольные линии
+ for(let k=0;k<=PNM;k+=6){
+  qctx.beginPath();
+  let started=false;
+  for(let it=0;it<=PNT;it++){
+   const tau=it/PNT;
+   const a=tau<0.5?1.25*(1-tau/0.5):-0.6*(tau-0.5)/0.5;
+   const r=0.34*(1+0.05*Math.sin(tau*14-tick*0.06));
+   const sec=crossSection(a,r,PNM);
+   const w=(tau-0.5)*1.25;
+   const p=proj(sec[k].u,sec[k].v,w);
+   if(!started){qctx.moveTo(p.x,p.y);started=true;}
+   else qctx.lineTo(p.x,p.y);
+  }
+  qctx.strokeStyle='rgba(200,220,255,0.10)';
+  qctx.stroke();
+ }
+
+ qctx.fillStyle='#9ad'; qctx.font='12px system-ui';
+ qctx.fillText('входящие струны',14,20);
+ qctx.fillStyle='#7cff7c';
+ qctx.fillText('исходящая струна',14,PH-14);
+ qctx.fillStyle='#666';
+ qctx.fillText('мировой лист: вершина соединения (τ ↑)',14,PH/2);
+}
+
+pants.addEventListener('mousedown',e=>{dragging=true;lx=e.clientX;ly=e.clientY;});
+window.addEventListener('mousemove',e=>{
+ if(!dragging)return;
+ spin+=(e.clientX-lx)*0.01;
+ tilt=Math.max(-1.3,Math.min(1.3,tilt+(e.clientY-ly)*0.01));
+ lx=e.clientX; ly=e.clientY;
+});
+window.addEventListener('mouseup',()=>{dragging=false;});
+
+// ---------------- цикл ----------------
+function frame(){
+ if(running){
+  for(let s=0;s<speed;s++)physStep();
+  interactions();
+  absorbCheck();
+  pushHistory();
+  tick++;
+  if(strings.length===0&&tick%90===0)spawnScene();
+ }
+ drawSim();
+ drawPants();
+ requestAnimationFrame(frame);
+}
+
+// ---------------- управление ----------------
+gsEl.addEventListener('input',()=>{gs=+gsEl.value;gsVal.textContent=gs.toFixed(2);});
+speedEl.addEventListener('input',()=>{speed=+speedEl.value;speedVal.textContent=speed;});
+braneChk.addEventListener('change',()=>{braneOn=braneChk.checked;});
+bhChk.addEventListener('change',()=>{bhOn=bhChk.checked;});
+pauseBtn.addEventListener('click',()=>{running=!running;pauseBtn.textContent=running?'Пауза':'Старт';});
+resetBtn.addEventListener('click',reset);
+addStrBtn.addEventListener('click',()=>{
+ if(braneOn){
+  strings.push(makeBraneString(60+Math.random()*(SH-120),120+Math.random()*80,1+Math.floor(Math.random()*3),0.8));
+ } else {
+  const cx=120+Math.random()*(SW-240), cy=100+Math.random()*(SH-200);
+  const ang=Math.random()*Math.PI, v=(Math.random()-0.5)*1.6;
+  strings.push(makeOpen(cx,cy,150,ang,1+Math.floor(Math.random()*3),12,v,-v*0.5));
+ }
+});
+addGravBtn.addEventListener('click',()=>{
+ strings.push(makeGraviton(300+Math.random()*350,80+Math.random()*(SH-160),(Math.random()-0.5)*0.6,(Math.random()-0.5)*0.6));
+ gravEmitted++;
+});
+
+reset(); frame();
+</script>
+</body>
+</html>

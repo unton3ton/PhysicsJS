@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>2D TDSE: двухщелевой эксперимент из первых принципов</title>
+<style>
+ body{background:#111;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#05050a;border:1px solid #333;display:block;margin:8px 0;}
+ .controls{display:flex;gap:16px;flex-wrap:wrap;align-items:center;}
+ #note{color:#889;font-size:13px;max-width:920px;}
+</style>
+</head>
+<body>
+<h2>Настоящее решение 2D уравнения Шрёдингера: волновой пакет и две щели</h2>
+<div class="controls">
+ <label><input id="det" type="checkbox"> детектор «какой щели»</label>
+ <label><input id="cur" type="checkbox" checked> ток j (стрелки)</label>
+ <label>шагов/кадр: <input id="speed" type="range" min="1" max="24" value="10"> <span id="speedVal">10</span></label>
+ <button id="pause">Пауза</button>
+ <button id="newpack">Новый пакет</button>
+ <button id="reset">Сброс</button>
+</div>
+<canvas id="main" width="900" height="450"></canvas>
+<canvas id="hist" width="900" height="150"></canvas>
+<div id="info"></div>
+<div id="note">
+ ħ=m=1, Δx=1. Барьер V₀=800 (отражающий), экран — поглощающая полоса с учётом вероятности (распределение Борна).
+ Голубые столбцы — накопленные «попадания» на экране, белая линия — теория Фраунгофера P(y)∝cos²(πdy/λL)·sinc²(πwy/λL).
+ Детектор пути реализован как смесь двух однощелевых экспериментов — интерференция исчезает без постулата коллапса.
+ Стрелки — локальный ток вероятности j=Im(ψ*∇ψ), длина ∝ скорости v=j/|ψ|².
+</div>
+<script>
+"use strict";
+const main=document.getElementById('main'), mctx=main.getContext('2d');
+const hist=document.getElementById('hist'), hctx=hist.getContext('2d');
+const info=document.getElementById('info');
+const detEl=document.getElementById('det');
+const curEl=document.getElementById('cur');
+const speedEl=document.getElementById('speed'), speedVal=document.getElementById('speedVal');
+const pauseBtn=document.getElementById('pause'), newpackBtn=document.getElementById('newpack'), resetBtn=document.getElementById('reset');
+
+// ----------------- сетка и параметры -----------------
+const Nx=288, Ny=144, NN=Nx*Ny;
+const yc=Ny/2;
+const BX0=144, BX1=146;              // барьер
+const A0=49,A1=59, B0=85,B1=95;      // щели A и B (строки)
+const S0=252, S1=266;                // экран (поглощающая полоса)
+const V0=800;
+const dt=0.1, beta=dt/4, gamma=dt/4; // m=ħ=dx=1
+const Ws=0.2, spongeW=0.3, spongeWidth=16;
+const x0=40, sigma=16, k0=1.2;
+
+const re=new Float64Array(NN),  im=new Float64Array(NN);
+const re2=new Float64Array(NN), im2=new Float64Array(NN); // вторая компонента (детектор)
+const Vboth=new Float64Array(NN), VA=new Float64Array(NN), VB=new Float64Array(NN);
+const RHr=new Float64Array(NN), RHi=new Float64Array(NN);
+const Lsz=Math.max(Nx,Ny);
+const cpR=new Float64Array(Lsz), cpI=new Float64Array(Lsz), dpR=new Float64Array(Lsz), dpI=new Float64Array(Lsz);
+const mask=new Float64Array(NN);
+const accY=new Float64Array(Ny);
+const dens=new Float64Array(NN);
+const theory=new Float64Array(Ny);
+
+let detector=false, currentOn=true, running=true, speed=+speedEl.value;
+let tGlobal=0, tEmit=0, packets=0, normTotal=1;
+let CR=null, CI=null;
+
+const screenFactor=Math.exp(-Ws*dt);
+const screenAbsW=1-screenFactor;
+
+// оффскрин для плотности
+const gcan=document.createElement('canvas'); gcan.width=Nx; gcan.height=Ny;
+const gctx=gcan.getContext('2d');
+const gimg=gctx.createImageData(Nx,Ny);
+
+// ----------------- потенциал и маски -----------------
+function buildPotential(V,openA,openB){
+ V.fill(0);
+ for(let i=BX0;i<=BX1;i++){
+  for(let j=0;j<Ny;j++){
+   const inA=j>=A0&&j<=A1, inB=j>=B0&&j<=B1;
+   if((inA&&openA)||(inB&&openB))continue;
+   V[j*Nx+i]=V0;
+  }
+ }
+}
+
+function buildMask(){
+ for(let j=0;j<Ny;j++)for(let i=0;i<Nx;i++){
+  const idx=j*Nx+i;
+  const dEdge=Math.min(i,Nx-1-i,j,Ny-1-j);
+  let W=0;
+  if(dEdge<spongeWidth){ const f=1-dEdge/spongeWidth; W+=spongeW*f*f; }
+  if(i>=S0&&i<=S1)W+=Ws;
+  mask[idx]=Math.exp(-W*dt);
+ }
+}
+
+function buildTheory(){
+ const lam=2*Math.PI/k0, Lf=112, d=36, w=11;
+ const sinc=u=>Math.abs(u)<1e-6?1:Math.sin(u)/u;
+ let tm=1e-12;
+ for(let j=0;j<Ny;j++){
+  const y=j-yc;
+  let v;
+  if(!detector){
+   v=Math.pow(Math.cos(Math.PI*d*y/(lam*Lf)),2)*Math.pow(sinc(Math.PI*w*y/(lam*Lf)),2);
+  } else {
+   v=0.5*(Math.pow(sinc(Math.PI*w*(y+18)/(lam*Lf)),2)+Math.pow(sinc(Math.PI*w*(y-18)/(lam*Lf)),2));
+  }
+  theory[j]=v; if(v>tm)tm=v;
+ }
+ for(let j=0;j<Ny;j++)theory[j]/=tm;
+}
+
+// ----------------- испускание пакета -----------------
+function emitPacket(){
+ for(let j=0;j<Ny;j++)for(let i=0;i<Nx;i++){
+  const idx=j*Nx+i;
+  const g=Math.exp(-((i-x0)*(i-x0)+(j-yc)*(j-yc))/(4*sigma*sigma));
+  re[idx]=g*Math.cos(k0*i); im[idx]=g*Math.sin(k0*i);
+ }
+ let s=0;
+ for(let idx=0;idx<NN;idx++)s+=re[idx]*re[idx]+im[idx]*im[idx];
+ const f=1/Math.sqrt(s);
+ for(let idx=0;idx<NN;idx++){ re[idx]*=f; im[idx]*=f; }
+ if(detector){
+  const c=1/Math.sqrt(2);
+  for(let idx=0;idx<NN;idx++){
+   re[idx]*=c; im[idx]*=c;
+   re2[idx]=re[idx]; im2[idx]=im[idx];
+  }
+ }
+ packets++; tEmit=tGlobal;
+}
+
+// ----------------- ADI Crank–Nicolson -----------------
+function thomasX(j,V){
+ const base=j*Nx, M=Nx-2;
+ let idx=base+1;
+ const Av=2*beta+gamma*V[idx];
+ let den=1+Av*Av;
+ cpR[0]=-beta*Av/den; cpI[0]=-beta/den;
+ let rr=RHr[idx], ri=RHi[idx];
+ dpR[0]=(rr+ri*Av)/den; dpI[0]=(ri-rr*Av)/den;
+ for(let k=1;k<M;k++){
+  idx=base+1+k;
+  const cr=cpR[k-1], ci=cpI[k-1];
+  const dre=1-beta*ci;
+  const dim=2*beta+gamma*V[idx]+beta*cr;
+  den=dre*dre+dim*dim;
+  if(k<M-1){ cpR[k]=-beta*dim/den; cpI[k]=-beta*dre/den; }
+  const nre=RHr[idx]-beta*dpI[k-1];
+  const nim=RHi[idx]+beta*dpR[k-1];
+  dpR[k]=(nre*dre+nim*dim)/den;
+  dpI[k]=(nim*dre-nre*dim)/den;
+ }
+ let xr=dpR[M-1], xi=dpI[M-1];
+ CR[base+M]=xr; CI[base+M]=xi;
+ for(let k=M-2;k>=0;k--){
+  const cr=cpR[k], ci=cpI[k];
+  const nr=dpR[k]-(cr*xr-ci*xi);
+  const ni=dpI[k]-(cr*xi+ci*xr);
+  xr=nr; xi=ni;
+  CR[base+1+k]=xr; CI[base+1+k]=xi;
+ }
+}
+
+function thomasY(i,V){
+ const M=Ny-2;
+ let idx=i+Nx;
+ const Av=2*beta+gamma*V[idx];
+ let den=1+Av*Av;
+ cpR[0]=-beta*Av/den; cpI[0]=-beta/den;
+ let rr=RHr[idx], ri=RHi[idx];
+ dpR[0]=(rr+ri*Av)/den; dpI[0]=(ri-rr*Av)/den;
+ for(let k=1;k<M;k++){
+  idx=i+(1+k)*Nx;
+  const cr=cpR[k-1], ci=cpI[k-1];
+  const dre=1-beta*ci;
+  const dim=2*beta+gamma*V[idx]+beta*cr;
+  den=dre*dre+dim*dim;
+  if(k<M-1){ cpR[k]=-beta*dim/den; cpI[k]=-beta*dre/den; }
+  const nre=RHr[idx]-beta*dpI[k-1];
+  const nim=RHi[idx]+beta*dpR[k-1];
+  dpR[k]=(nre*dre+nim*dim)/den;
+  dpI[k]=(nim*dre-nre*dim)/den;
+ }
+ let xr=dpR[M-1], xi=dpI[M-1];
+ CR[i+M*Nx]=xr; CI[i+M*Nx]=xi;
+ for(let k=M-2;k>=0;k--){
+  const cr=cpR[k], ci=cpI[k];
+  const nr=dpR[k]-(cr*xr-ci*xi);
+  const ni=dpI[k]-(cr*xi+ci*xr);
+  xr=nr; xi=ni;
+  CR[i+(1+k)*Nx]=xr; CI[i+(1+k)*Nx]=xi;
+ }
+}
+
+function adiStep(R,I,V){
+ CR=R; CI=I;
+ // RHS: кинетика по y, полушаг X
+ for(let j=1;j<Ny-1;j++){
+  const row=j*Nx;
+  RHr[row]=0;RHi[row]=0;RHr[row+Nx-1]=0;RHi[row+Nx-1]=0;
+  for(let i=1;i<Nx-1;i++){
+   const idx=row+i;
+   const A=2*beta+gamma*V[idx];
+   const zr=R[idx], zi=I[idx];
+   const nre=R[idx-1]+R[idx+1], nim=I[idx-1]+I[idx+1];
+   RHr[idx]=zr+A*zi-beta*nim;
+   RHi[idx]=zi-A*zr+beta*nre;
+  }
+ }
+ for(let i=0;i<Nx;i++){RHr[i]=RHi[i]=0;RHr[(Ny-1)*Nx+i]=RHi[(Ny-1)*Nx+i]=0;}
+ for(let j=1;j<Ny-1;j++)thomasX(j,V);
+ // RHS: кинетика по x, полушаг Y
+ for(let j=1;j<Ny-1;j++){
+  const row=j*Nx;
+  RHr[row]=0;RHi[row]=0;RHr[row+Nx-1]=0;RHi[row+Nx-1]=0;
+  for(let i=1;i<Nx-1;i++){
+   const idx=row+i;
+   const A=2*beta+gamma*V[idx];
+   const zr=R[idx], zi=I[idx];
+   const nre=R[idx-Nx]+R[idx+Nx], nim=I[idx-Nx]+I[idx+Nx];
+   RHr[idx]=zr+A*zi-beta*nim;
+   RHi[idx]=zi-A*zr+beta*nre;
+  }
+ }
+ for(let i=0;i<Nx;i++){RHr[i]=RHi[i]=0;RHr[(Ny-1)*Nx+i]=RHi[(Ny-1)*Nx+i]=0;}
+ for(let i=1;i<Nx-1;i++)thomasY(i,V);
+}
+
+function stepComponent(R,I,V){
+ adiStep(R,I,V);
+ // учёт поглощения экраном (до демпфирования)
+ for(let j=1;j<Ny-1;j++){
+  const row=j*Nx;
+  let s=0;
+  for(let i=S0;i<=S1;i++){ const idx=row+i; s+=R[idx]*R[idx]+I[idx]*I[idx]; }
+  accY[j]+=s*screenAbsW;
+ }
+ for(let idx=0;idx<NN;idx++){ R[idx]*=mask[idx]; I[idx]*=mask[idx]; }
+}
+
+function update(){
+ for(let s=0;s<speed;s++){
+  tGlobal+=dt;
+  if(detector){ stepComponent(re,im,VA); stepComponent(re2,im2,VB); }
+  else stepComponent(re,im,Vboth);
+ }
+ let n=0;
+ for(let idx=0;idx<NN;idx++){
+  n+=re[idx]*re[idx]+im[idx]*im[idx];
+  if(detector)n+=re2[idx]*re2[idx]+im2[idx]*im2[idx];
+ }
+ normTotal=n;
+ if(n<0.04&&tGlobal-tEmit>40)emitPacket();
+}
+
+// ----------------- отрисовка -----------------
+function computeDens(){
+ let mx=1e-12;
+ for(let idx=0;idx<NN;idx++){
+  let d=re[idx]*re[idx]+im[idx]*im[idx];
+  if(detector)d+=re2[idx]*re2[idx]+im2[idx]*im2[idx];
+  dens[idx]=d; if(d>mx)mx=d;
+ }
+ return mx;
+}
+
+function drawCurrent(mx){
+ const kx=main.width/Nx, ky=main.height/Ny;
+ const STEP=10;
+ const gate=0.005*mx;
+ const vmax=2.0, maxLen=12;
+ mctx.lineCap='round';
+ for(let j=STEP;j<Ny-STEP;j+=STEP){
+  for(let i=STEP;i<Nx-STEP;i+=STEP){
+   const idx=j*Nx+i;
+   let rho=0,jx=0,jy=0;
+   {
+    const r=re[idx],m=im[idx],rr=r*r+m*m;
+    if(rr>1e-12){
+     const rx=(re[idx+1]-re[idx-1])*0.5, ix=(im[idx+1]-im[idx-1])*0.5;
+     const ry=(re[idx+Nx]-re[idx-Nx])*0.5, iy=(im[idx+Nx]-im[idx-Nx])*0.5;
+     rho+=rr; jx+=r*ix-m*rx; jy+=r*iy-m*ry;
+    }
+   }
+   if(detector){
+    const r=re2[idx],m=im2[idx],rr=r*r+m*m;
+    if(rr>1e-12){
+     const rx=(re2[idx+1]-re2[idx-1])*0.5, ix=(im2[idx+1]-im2[idx-1])*0.5;
+     const ry=(re2[idx+Nx]-re2[idx-Nx])*0.5, iy=(im2[idx+Nx]-im2[idx-Nx])*0.5;
+     rho+=rr; jx+=r*ix-m*rx; jy+=r*iy-m*ry;
+    }
+   }
+   if(rho<gate)continue;
+   const vx=jx/rho, vy=jy/rho;
+   const sp=Math.hypot(vx,vy);
+   if(sp<1e-4)continue;
+   const len=Math.min(sp,vmax)/vmax*maxLen;
+   const ux=vx/sp, uy=vy/sp;
+   const cx=i*kx, cy=j*ky;
+   const x1=cx-ux*len*0.5, y1=cy-uy*len*0.5;
+   const x2=cx+ux*len*0.5, y2=cy+uy*len*0.5;
+   const alpha=Math.min(1, 0.2+(rho/mx)*4);
+   mctx.strokeStyle=`rgba(0,0,0,${(alpha*0.7).toFixed(3)})`;
+   mctx.lineWidth=2.6;
+   mctx.beginPath(); mctx.moveTo(x1,y1); mctx.lineTo(x2,y2); mctx.stroke();
+   mctx.strokeStyle=`rgba(120,220,255,${alpha.toFixed(3)})`;
+   mctx.lineWidth=1.2;
+   mctx.beginPath(); mctx.moveTo(x1,y1); mctx.lineTo(x2,y2); mctx.stroke();
+   const ah=3.2;
+   mctx.beginPath();
+   mctx.moveTo(x2,y2);
+   mctx.lineTo(x2-ux*ah-uy*ah*0.7, y2-uy*ah+ux*ah*0.7);
+   mctx.moveTo(x2,y2);
+   mctx.lineTo(x2-ux*ah+uy*ah*0.7, y2-uy*ah-ux*ah*0.7);
+   mctx.stroke();
+  }
+ }
+}
+
+function drawMain(){
+ const mx=computeDens();
+ const d=gimg.data;
+ for(let idx=0;idx<NN;idx++){
+  const t=Math.sqrt(dens[idx]/mx);
+  d[idx*4]  =Math.min(255,255*1.7*t);
+  d[idx*4+1]=Math.min(255,255*Math.max(0,1.7*t-0.5));
+  d[idx*4+2]=Math.min(255,20+255*Math.max(0,1.7*t-1.0));
+  d[idx*4+3]=255;
+ }
+ gctx.putImageData(gimg,0,0);
+ mctx.imageSmoothingEnabled=true;
+ mctx.fillStyle='#05050a'; mctx.fillRect(0,0,main.width,main.height);
+ mctx.drawImage(gcan,0,0,main.width,main.height);
+
+ const kx=main.width/Nx, ky=main.height/Ny;
+
+ // барьер
+ mctx.fillStyle='rgba(160,170,190,0.95)';
+ const bw=(BX1-BX0+1)*kx;
+ mctx.fillRect(BX0*kx,0,bw,(A0)*ky);
+ mctx.fillRect(BX0*kx,(A1+1)*ky,bw,(B0-A1-1)*ky);
+ mctx.fillRect(BX0*kx,(B1+1)*ky,bw,(Ny-B1-1)*ky);
+
+ mctx.fillStyle='#cfd8ea'; mctx.font='12px system-ui';
+ mctx.fillText('щель A',BX0*kx-52,(yc-18)*ky);
+ mctx.fillText('щель B',BX0*kx-52,(yc+22)*ky);
+ mctx.fillText('барьер',BX0*kx-56,16);
+
+ // экран
+ mctx.fillStyle='rgba(0,229,255,0.10)';
+ mctx.fillRect(S0*kx,0,(S1-S0+1)*kx,main.height);
+ mctx.fillStyle='#00e5ff';
+ mctx.fillText('экран (поглощение → Борн)',S0*kx-4,main.height-10);
+
+ // источник
+ mctx.strokeStyle='#ffd76a'; mctx.lineWidth=1.5;
+ mctx.beginPath(); mctx.arc(x0*kx,yc*ky,7,0,Math.PI*2); mctx.stroke();
+ mctx.fillStyle='#ffd76a';
+ mctx.fillText('источник пакетов',x0*kx-30,yc*ky-14);
+
+ if(detector){
+  mctx.fillStyle='#ffd43b';
+  mctx.fillRect(BX0*kx+bw+2,(A0)*ky,6,(A1-A0+1)*ky);
+  mctx.fillRect(BX0*kx+bw+2,(B0)*ky,6,(B1-B0+1)*ky);
+  mctx.fillText('детектор пути',BX0*kx+bw+12,16);
+ }
+
+ if(currentOn) drawCurrent(mx);
+}
+
+function drawHist(){
+ const W2=hist.width,H2=hist.height;
+ hctx.fillStyle='#05050a'; hctx.fillRect(0,0,W2,H2);
+ let mx=1e-9;
+ for(let j=0;j<Ny;j++)if(accY[j]>mx)mx=accY[j];
+ hctx.fillStyle='rgba(0,229,255,0.8)';
+ for(let j=2;j<Ny-2;j++){
+  const x=20+(j/(Ny-1))*(W2-40);
+  const hgt=(accY[j]/mx)*(H2-36);
+  hctx.fillRect(x-1.4,H2-16-hgt,2.8,hgt);
+ }
+ hctx.strokeStyle='rgba(255,255,255,0.85)'; hctx.lineWidth=1.4;
+ hctx.beginPath();
+ for(let j=2;j<Ny-2;j++){
+  const x=20+(j/(Ny-1))*(W2-40);
+  const y=H2-16-theory[j]*(H2-36);
+  j===2?hctx.moveTo(x,y):hctx.lineTo(x,y);
+ }
+ hctx.stroke();
+ hctx.fillStyle='#789'; hctx.font='12px system-ui';
+ hctx.fillText('распределение на экране: голубое — накопленный |ψ|² (поглощение), белое — теория',20,14);
+}
+
+function drawInfo(){
+ let totalAcc=0;
+ for(let j=0;j<Ny;j++)totalAcc+=accY[j];
+ info.textContent=
+  `t = ${tGlobal.toFixed(1)} | пакет № ${packets} | норма = ${normTotal.toFixed(3)} | `+
+  `экран собрал ${(100*totalAcc/Math.max(1,packets)).toFixed(1)}% вероятности | `+
+  `режим: ${detector?'детектор пути (смесь, без интерференции)':'когерентный (интерференция)'}`;
+}
+
+// ----------------- цикл -----------------
+function frame(){
+ if(running)update();
+ drawMain();
+ drawHist();
+ drawInfo();
+ requestAnimationFrame(frame);
+}
+
+// ----------------- управление -----------------
+function fullReset(){
+ accY.fill(0);
+ packets=0; tGlobal=0;
+ buildTheory();
+ emitPacket();
+}
+
+detEl.addEventListener('change',()=>{ detector=detEl.checked; fullReset(); });
+curEl.addEventListener('change',()=>{ currentOn=curEl.checked; });
+speedEl.addEventListener('input',()=>{ speed=+speedEl.value; speedVal.textContent=speed; });
+pauseBtn.addEventListener('click',()=>{ running=!running; pauseBtn.textContent=running?'Пауза':'Старт'; });
+newpackBtn.addEventListener('click',()=>emitPacket());
+resetBtn.addEventListener('click',fullReset);
+
+buildPotential(Vboth,true,true);
+buildPotential(VA,true,false);
+buildPotential(VB,false,true);
+buildMask();
+buildTheory();
+emitPacket();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

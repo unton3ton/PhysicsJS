@@ -1,0 +1,1184 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Квантовый волновой пакет: электрон, фотоны, фононы</title>
+<style>
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    padding: 14px;
+    background: #04060d;
+    color: #dbe6ff;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 650;
+  }
+
+  .panel {
+    width: 1160px;
+    max-width: 97vw;
+    background: #0b1122;
+    border: 1px solid #263864;
+    border-radius: 14px;
+    padding: 10px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 18px;
+    align-items: center;
+  }
+
+  button {
+    background: #17305e;
+    color: #eaf2ff;
+    border: 1px solid #3d5c99;
+    border-radius: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+
+  button:hover {
+    background: #1d3d76;
+  }
+
+  label {
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    white-space: nowrap;
+  }
+
+  input[type="range"] {
+    width: 105px;
+  }
+
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+  }
+
+  canvas {
+    border: 1px solid #263864;
+    border-radius: 14px;
+    background: #04060d;
+    max-width: 97vw;
+  }
+
+  #stats {
+    width: 1160px;
+    max-width: 97vw;
+    font-size: 14px;
+    line-height: 1.45;
+    color: #c8d8ff;
+  }
+
+  .hint {
+    width: 1160px;
+    max-width: 97vw;
+    color: #91a6d6;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .val {
+    color: #8ff0ff;
+    min-width: 84px;
+    display: inline-block;
+  }
+</style>
+</head>
+<body>
+
+<h1>Волновой пакет электрона в слое вещества: прохождение, поглощение, фотоны и фононы</h1>
+
+<div class="panel">
+  <button id="restartBtn">Перезапустить пакет</button>
+
+  <label class="check">
+    <input id="pauseChk" type="checkbox">
+    Пауза
+  </label>
+
+  <label class="check">
+    <input id="phaseChk" type="checkbox" checked>
+    Показывать Re ψ
+  </label>
+
+  <label>
+    k₀
+    <span id="kVal" class="val"></span>
+    <input id="kRange" type="range" min="0.5" max="4.0" step="0.05" value="2.0">
+  </label>
+
+  <label>
+    Барьер V
+    <span id="vVal" class="val"></span>
+    <input id="vRange" type="range" min="-5.0" max="10.0" step="0.1" value="2.0">
+  </label>
+
+  <label>
+    Поглощение W
+    <span id="wVal" class="val"></span>
+    <input id="absorbRange" type="range" min="0.0" max="0.30" step="0.005" value="0.06">
+  </label>
+
+  <label>
+    Толщина слоя
+    <span id="thVal" class="val"></span>
+    <input id="thicknessRange" type="range" min="5" max="70" step="1" value="30">
+  </label>
+
+  <label>
+    Выход фотонов
+    <span id="photonGainVal" class="val"></span>
+    <input id="photonGainRange" type="range" min="0" max="3000" step="10" value="700">
+  </label>
+
+  <label>
+    Выход фононов
+    <span id="phononGainVal" class="val"></span>
+    <input id="phononGainRange" type="range" min="0" max="5000" step="10" value="1600">
+  </label>
+</div>
+
+<canvas id="view" width="1160" height="580"></canvas>
+
+<div id="stats"></div>
+
+<div class="hint">
+  Это учебная 1D-модель: волновой пакет решает уравнение Шрёдингера методом split-step Fourier.
+  Слой вещества имеет действительный потенциал V и мнимую поглощающую часть W.
+  Убывание нормы в слое считается поглощённой вероятностью и визуально превращается в фотоны и фононы.
+  Левый детектор регистрирует отражённую часть, правый — прошедшую.
+  Зелёные кольца — фононы, волнистые линии — фотоны, атомы в слое показывают нагрев и колебания.
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d");
+  const CW = canvas.width;
+  const CH = canvas.height;
+
+  const $ = id => document.getElementById(id);
+
+  const ui = {
+    restart: $("restartBtn"),
+    pause: $("pauseChk"),
+    phase: $("phaseChk"),
+    k: $("kRange"),
+    barrier: $("vRange"),
+    absorb: $("absorbRange"),
+    thickness: $("thicknessRange"),
+    photonGain: $("photonGainRange"),
+    phononGain: $("phononGainRange")
+  };
+
+  // =======================
+  // Численная сетка
+  // =======================
+  const N = 1024;              // должно быть степенью 2
+  const L = 240;               // длина расчётной области
+  const dx = L / N;
+  const xmin = -L / 2;
+  const xmax = L / 2;
+
+  const dt = 0.025;
+  const STEPS_PER_FRAME = 10;
+
+  const x = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    x[i] = xmin + i * dx;
+  }
+
+  // k-пространство для FFT
+  const k = new Float64Array(N);
+  for (let j = 0; j < N; j++) {
+    const freq = (j <= N / 2) ? j : j - N;
+    k[j] = 2 * Math.PI * freq / L;
+  }
+
+  // Волновая функция
+  let re = new Float64Array(N);
+  let im = new Float64Array(N);
+
+  // Потенциалы и маски
+  const V = new Float64Array(N);
+  const W = new Float64Array(N);
+  const mask = new Uint8Array(N); // 0 нет, 1 слой, 2 левый детектор, 3 правый детектор
+
+  // Пропагаторы
+  const potRe = new Float64Array(N);
+  const potIm = new Float64Array(N);
+  const lossFactor = new Float64Array(N);
+  const kinCos = new Float64Array(N);
+  const kinSin = new Float64Array(N);
+
+  // Поглощённая вероятность в слое за кадр
+  const absorbWeight = new Float64Array(N);
+
+  // Параметры слоя
+  let slabThickness = Number(ui.thickness.value);
+  let slabLeft = -slabThickness / 2;
+  let slabRight = slabThickness / 2;
+  let slabCanv0 = 0;
+  let slabCanv1 = 0;
+
+  const EDGE_WIDTH = 28;
+  const EDGE_STRENGTH = 0.85;
+
+  // Счётчики вероятностей
+  let materialAbsorbed = 0;
+  let leftDetected = 0;
+  let rightDetected = 0;
+  let frameMaterialLoss = 0;
+
+  let currentNorm = 1;
+  let currentSlab = 0;
+  let densityScaleMax = 1e-6;
+
+  // Визуальные объекты
+  let atoms = [];
+  let photons = [];
+  let phonons = [];
+  let flashes = [];
+
+  let stats = {
+    photons: 0,
+    phonons: 0,
+    photonsAbsorbed: 0
+  };
+
+  let frame = 0;
+
+  // =======================
+  // Утилиты
+  // =======================
+  function rand(a, b) {
+    return a + Math.random() * (b - a);
+  }
+
+  function randn() {
+    let u = 0;
+    let v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  function poisson(lambda) {
+    if (lambda <= 0) return 0;
+
+    if (lambda > 50) {
+      return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * randn()));
+    }
+
+    const limit = Math.exp(-lambda);
+    let kk = 0;
+    let p = 1;
+
+    do {
+      kk++;
+      p *= Math.random();
+    } while (p > limit);
+
+    return kk - 1;
+  }
+
+  function xToCanvas(xSim) {
+    return (xSim + L / 2) / L * CW;
+  }
+
+  function updateLabels() {
+    const k0 = Number(ui.k.value);
+    $("kVal").textContent = `${k0.toFixed(2)} (E=${(k0 * k0 / 2).toFixed(2)})`;
+    $("vVal").textContent = Number(ui.barrier.value).toFixed(1);
+    $("wVal").textContent = Number(ui.absorb.value).toFixed(3);
+    $("thVal").textContent = ui.thickness.value + " а.е.";
+    $("photonGainVal").textContent = ui.photonGain.value;
+    $("phononGainVal").textContent = ui.phononGain.value;
+  }
+
+  // =======================
+  // FFT
+  // =======================
+  function fft(arrRe, arrIm, inverse) {
+    const n = arrRe.length;
+
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) {
+        j ^= bit;
+      }
+      j ^= bit;
+
+      if (i < j) {
+        let tmp = arrRe[i];
+        arrRe[i] = arrRe[j];
+        arrRe[j] = tmp;
+
+        tmp = arrIm[i];
+        arrIm[i] = arrIm[j];
+        arrIm[j] = tmp;
+      }
+    }
+
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = 2 * Math.PI / len * (inverse ? 1 : -1);
+      const wlenRe = Math.cos(ang);
+      const wlenIm = Math.sin(ang);
+      const half = len >> 1;
+
+      for (let i = 0; i < n; i += len) {
+        let wRe = 1;
+        let wIm = 0;
+
+        for (let j = 0; j < half; j++) {
+          const aRe = arrRe[i + j];
+          const aIm = arrIm[i + j];
+
+          const bRe = arrRe[i + j + half];
+          const bIm = arrIm[i + j + half];
+
+          const vRe = bRe * wRe - bIm * wIm;
+          const vIm = bRe * wIm + bIm * wRe;
+
+          arrRe[i + j] = aRe + vRe;
+          arrIm[i + j] = aIm + vIm;
+
+          arrRe[i + j + half] = aRe - vRe;
+          arrIm[i + j + half] = aIm - vIm;
+
+          const nextRe = wRe * wlenRe - wIm * wlenIm;
+          const nextIm = wRe * wlenIm + wIm * wlenRe;
+
+          wRe = nextRe;
+          wIm = nextIm;
+        }
+      }
+    }
+
+    if (inverse) {
+      for (let i = 0; i < n; i++) {
+        arrRe[i] /= n;
+        arrIm[i] /= n;
+      }
+    }
+  }
+
+  // =======================
+  // Построение потенциалов
+  // =======================
+  function buildKineticPropagator() {
+    for (let i = 0; i < N; i++) {
+      const phase = -0.5 * k[i] * k[i] * dt;
+      kinCos[i] = Math.cos(phase);
+      kinSin[i] = Math.sin(phase);
+    }
+  }
+
+  function rebuildPotential() {
+    slabThickness = Number(ui.thickness.value);
+    slabLeft = -slabThickness / 2;
+    slabRight = slabThickness / 2;
+
+    slabCanv0 = xToCanvas(slabLeft);
+    slabCanv1 = xToCanvas(slabRight);
+
+    V.fill(0);
+    W.fill(0);
+    mask.fill(0);
+
+    const V0 = Number(ui.barrier.value);
+    const Wmat = Number(ui.absorb.value);
+
+    for (let i = 0; i < N; i++) {
+      const xi = x[i];
+
+      // Слой вещества
+      if (xi >= slabLeft && xi <= slabRight) {
+        V[i] = V0;
+        W[i] = Wmat;
+        mask[i] = 1;
+      }
+
+      // Левый детектор-поглотитель отражённой волны
+      if (xi < xmin + EDGE_WIDTH) {
+        const u = (xmin + EDGE_WIDTH - xi) / EDGE_WIDTH;
+        W[i] += EDGE_STRENGTH * u * u;
+        if (mask[i] !== 1) mask[i] = 2;
+      }
+
+      // Правый детектор-поглотитель прошедшей волны
+      if (xi > xmax - EDGE_WIDTH) {
+        const u = (xi - (xmax - EDGE_WIDTH)) / EDGE_WIDTH;
+        W[i] += EDGE_STRENGTH * u * u;
+        if (mask[i] !== 1) mask[i] = 3;
+      }
+    }
+
+    buildPotentialPropagator();
+  }
+
+  function buildPotentialPropagator() {
+    const halfDt = dt / 2;
+
+    for (let i = 0; i < N; i++) {
+      const amp = Math.exp(-W[i] * halfDt);
+      const phase = -V[i] * halfDt;
+
+      potRe[i] = Math.cos(phase) * amp;
+      potIm[i] = Math.sin(phase) * amp;
+
+      lossFactor[i] = 1 - amp * amp;
+    }
+  }
+
+  // =======================
+  // Начальный волновой пакет
+  // =======================
+  function resetWave() {
+    const k0 = Number(ui.k.value);
+    const sigma = 7;
+    const x0 = -65;
+
+    let norm = 0;
+    let maxP = 0;
+
+    for (let i = 0; i < N; i++) {
+      const xi = x[i];
+      const g = Math.exp(-((xi - x0) * (xi - x0)) / (2 * sigma * sigma));
+      const phase = k0 * xi;
+
+      re[i] = g * Math.cos(phase);
+      im[i] = g * Math.sin(phase);
+
+      const p = re[i] * re[i] + im[i] * im[i];
+      norm += p;
+
+      if (p > maxP) maxP = p;
+    }
+
+    const factor = 1 / Math.sqrt(norm * dx);
+
+    let maxAfter = 0;
+
+    for (let i = 0; i < N; i++) {
+      re[i] *= factor;
+      im[i] *= factor;
+
+      const p = re[i] * re[i] + im[i] * im[i];
+      if (p > maxAfter) maxAfter = p;
+    }
+
+    densityScaleMax = Math.max(1e-6, maxAfter);
+  }
+
+  // =======================
+  // Атомы для визуализации
+  // =======================
+  function makeAtoms() {
+    atoms = [];
+
+    const spacing = 24;
+
+    let xStart = slabCanv0 + 8;
+    let xEnd = slabCanv1 - 8;
+
+    if (xEnd < xStart) {
+      const mid = (slabCanv0 + slabCanv1) / 2;
+      xStart = mid;
+      xEnd = mid;
+    }
+
+    for (let xx = xStart; xx <= xEnd + 0.01; xx += spacing) {
+      for (let yy = 100; yy <= 460; yy += spacing) {
+        const ang = Math.random() * Math.PI * 2;
+        atoms.push({
+          x0: xx,
+          y0: yy,
+          x: xx,
+          y: yy,
+          phase: Math.random() * Math.PI * 2,
+          amp: 0,
+          heat: 0,
+          dirx: Math.cos(ang),
+          diry: Math.sin(ang)
+        });
+      }
+    }
+  }
+
+  function heatAtoms(xp, yp, radius, energy) {
+    for (const atom of atoms) {
+      const dxA = atom.x0 - xp;
+      const dyA = atom.y0 - yp;
+      const d = Math.sqrt(dxA * dxA + dyA * dyA);
+
+      if (d < radius) {
+        const w = 1 - d / radius;
+        atom.amp += energy * w * 1.2;
+        atom.heat += energy * w * 0.45;
+      }
+    }
+  }
+
+  function updateAtom(atom) {
+    atom.amp = Math.min(8, atom.amp * 0.975);
+    atom.heat = Math.min(12, atom.heat * 0.988);
+
+    atom.phase += 0.18 + atom.amp * 0.03;
+
+    const s = Math.sin(atom.phase);
+    const c = Math.cos(atom.phase * 0.83);
+
+    atom.x = atom.x0 + atom.dirx * atom.amp * s;
+    atom.y = atom.y0 + atom.diry * atom.amp * c;
+  }
+
+  // =======================
+  // Фотоны и фононы
+  // =======================
+  function photonColor(energy) {
+    const t = Math.min(1, energy / 25);
+    const hue = 20 + 260 * t;
+    return `hsl(${hue}, 100%, 65%)`;
+  }
+
+  function addFlash(xp, yp, color) {
+    if (flashes.length > 90) flashes.shift();
+    flashes.push({ x: xp, y: yp, r: 4, life: 1, color });
+  }
+
+  function spawnPhotonAt(idx) {
+    if (idx < 0 || idx >= N) return;
+
+    const px = xToCanvas(x[idx]);
+    const py = rand(120, 440);
+    const energy = rand(3, 18);
+
+    photons.push({
+      x: px,
+      y: py,
+      angle: Math.random() * Math.PI * 2,
+      energy,
+      speed: 3.5 + Math.min(5, energy * 0.10),
+      phase: Math.random() * 10,
+      alive: true
+    });
+
+    stats.photons++;
+    addFlash(px, py, photonColor(energy));
+  }
+
+  function spawnPhononAtCanvas(px, py, energy) {
+    phonons.push({
+      x: px,
+      y: py,
+      r: 4,
+      speed: 1.0 + Math.random() * 0.9,
+      maxR: 50 + energy * 22,
+      energy,
+      alive: true
+    });
+
+    stats.phonons++;
+    addFlash(px, py, "rgba(120,255,170,0.85)");
+  }
+
+  function spawnPhononAt(idx) {
+    if (idx < 0 || idx >= N) return;
+
+    const px = xToCanvas(x[idx]);
+    const py = rand(120, 440);
+    const energy = rand(0.4, 3.0);
+
+    spawnPhononAtCanvas(px, py, energy);
+  }
+
+  function updatePhoton(p) {
+    p.x += Math.cos(p.angle) * p.speed;
+    p.y += Math.sin(p.angle) * p.speed;
+    p.phase += 0.55;
+
+    // Поглощение фотона веществом
+    if (p.x > slabCanv0 && p.x < slabCanv1 && Math.random() < 0.004) {
+      p.alive = false;
+      stats.photonsAbsorbed++;
+
+      heatAtoms(p.x, p.y, 22, Math.min(10, p.energy * 0.35));
+      addFlash(p.x, p.y, photonColor(p.energy));
+
+      if (Math.random() < 0.5) {
+        spawnPhononAtCanvas(p.x, p.y, rand(0.2, 1.2));
+      }
+    }
+
+    if (p.x < -70 || p.x > CW + 70 || p.y < -70 || p.y > CH + 70) {
+      p.alive = false;
+    }
+  }
+
+  function updatePhonon(ph) {
+    ph.r += ph.speed;
+
+    for (const atom of atoms) {
+      const dxA = atom.x0 - ph.x;
+      const dyA = atom.y0 - ph.y;
+      const d = Math.sqrt(dxA * dxA + dyA * dyA);
+
+      const width = 12;
+      if (Math.abs(d - ph.r) < width && Math.random() < 0.08) {
+        const gain = ph.energy * 0.5 * Math.max(0, 1 - ph.r / ph.maxR);
+        atom.amp += gain;
+        atom.heat += gain * 0.25;
+      }
+    }
+
+    if (ph.r > ph.maxR) {
+      ph.alive = false;
+    }
+  }
+
+  // =======================
+  // Выбор места поглощения
+  // =======================
+  function sampleAbsorptionIndex() {
+    let total = 0;
+
+    for (let i = 0; i < N; i++) {
+      if (mask[i] === 1) total += absorbWeight[i];
+    }
+
+    if (total <= 1e-18) {
+      // Если потерь нет, но событие всё же нужно, выбираем случайную точку в слое
+      for (let tries = 0; tries < 20; tries++) {
+        const idx = Math.floor(Math.random() * N);
+        if (mask[idx] === 1) return idx;
+      }
+      return -1;
+    }
+
+    let r = Math.random() * total;
+
+    for (let i = 0; i < N; i++) {
+      if (mask[i] !== 1) continue;
+
+      r -= absorbWeight[i];
+      if (r <= 0) return i;
+    }
+
+    for (let i = N - 1; i >= 0; i--) {
+      if (mask[i] === 1) return i;
+    }
+
+    return -1;
+  }
+
+  function spawnEventsFromAbsorption() {
+    const photonGain = Number(ui.photonGain.value);
+    const phononGain = Number(ui.phononGain.value);
+
+    const lambdaPhotons = frameMaterialLoss * photonGain;
+    const lambdaPhonons = frameMaterialLoss * phononGain;
+
+    let nPhotons = poisson(lambdaPhotons);
+    let nPhonons = poisson(lambdaPhonons);
+
+    nPhotons = Math.min(20, nPhotons);
+    nPhonons = Math.min(25, nPhonons);
+
+    for (let i = 0; i < nPhotons; i++) {
+      spawnPhotonAt(sampleAbsorptionIndex());
+    }
+
+    for (let i = 0; i < nPhonons; i++) {
+      spawnPhononAt(sampleAbsorptionIndex());
+    }
+  }
+
+  // =======================
+  // Шаги эволюции Шрёдингера
+  // =======================
+  function applyPotentialHalf() {
+    for (let i = 0; i < N; i++) {
+      const oldRe = re[i];
+      const oldIm = im[i];
+
+      const c = potRe[i];
+      const s = potIm[i];
+
+      re[i] = oldRe * c - oldIm * s;
+      im[i] = oldRe * s + oldIm * c;
+
+      const lf = lossFactor[i];
+
+      if (lf > 1e-16) {
+        const oldProb = (oldRe * oldRe + oldIm * oldIm) * dx;
+        const lost = oldProb * lf;
+
+        if (lost > 0) {
+          const m = mask[i];
+
+          if (m === 1) {
+            materialAbsorbed += lost;
+            frameMaterialLoss += lost;
+            absorbWeight[i] += lost;
+          } else if (m === 2) {
+            leftDetected += lost;
+          } else if (m === 3) {
+            rightDetected += lost;
+          }
+        }
+      }
+    }
+  }
+
+  function applyKinetic() {
+    for (let i = 0; i < N; i++) {
+      const a = re[i];
+      const b = im[i];
+      const c = kinCos[i];
+      const s = kinSin[i];
+
+      re[i] = a * c - b * s;
+      im[i] = a * s + b * c;
+    }
+  }
+
+  function stepSchrodinger() {
+    for (let step = 0; step < STEPS_PER_FRAME; step++) {
+      applyPotentialHalf();
+
+      fft(re, im, false);
+      applyKinetic();
+      fft(re, im, true);
+
+      applyPotentialHalf();
+    }
+  }
+
+  function computeDiagnostics() {
+    let norm = 0;
+    let slabProb = 0;
+    let maxP = 0;
+
+    for (let i = 0; i < N; i++) {
+      const p = re[i] * re[i] + im[i] * im[i];
+      const prob = p * dx;
+
+      norm += prob;
+
+      if (x[i] >= slabLeft && x[i] <= slabRight) {
+        slabProb += prob;
+      }
+
+      if (p > maxP) maxP = p;
+    }
+
+    currentNorm = norm;
+    currentSlab = slabProb;
+
+    densityScaleMax = Math.max(
+      Math.max(1e-6, maxP),
+      densityScaleMax * 0.995
+    );
+  }
+
+  function updateObjects() {
+    for (const p of photons) updatePhoton(p);
+    for (const ph of phonons) updatePhonon(ph);
+    for (const atom of atoms) updateAtom(atom);
+
+    for (const f of flashes) {
+      f.r += 1.5;
+      f.life -= 0.04;
+    }
+
+    photons = photons.filter(p => p.alive);
+    phonons = phonons.filter(p => p.alive);
+    flashes = flashes.filter(f => f.life > 0);
+
+    if (photons.length > 90) photons.splice(0, photons.length - 90);
+    if (phonons.length > 70) phonons.splice(0, phonons.length - 70);
+    if (flashes.length > 90) flashes.splice(0, flashes.length - 90);
+  }
+
+  function update() {
+    absorbWeight.fill(0);
+    frameMaterialLoss = 0;
+
+    stepSchrodinger();
+
+    spawnEventsFromAbsorption();
+    computeDiagnostics();
+    updateObjects();
+  }
+
+  // =======================
+  // Полный сброс
+  // =======================
+  function fullReset() {
+    materialAbsorbed = 0;
+    leftDetected = 0;
+    rightDetected = 0;
+    frameMaterialLoss = 0;
+
+    currentNorm = 1;
+    currentSlab = 0;
+
+    photons = [];
+    phonons = [];
+    flashes = [];
+
+    stats = {
+      photons: 0,
+      phonons: 0,
+      photonsAbsorbed: 0
+    };
+
+    updateLabels();
+    rebuildPotential();
+    resetWave();
+    makeAtoms();
+    computeDiagnostics();
+  }
+
+  // =======================
+  // Отрисовка
+  // =======================
+  function drawBackgroundAndSlab() {
+    ctx.fillStyle = "#04060d";
+    ctx.fillRect(0, 0, CW, CH);
+
+    // Левая детекторная зона
+    const leftEdge = xToCanvas(xmin + EDGE_WIDTH);
+    ctx.fillStyle = "rgba(255,120,90,0.05)";
+    ctx.fillRect(0, 0, leftEdge, CH);
+
+    // Правая детекторная зона
+    const rightEdge = xToCanvas(xmax - EDGE_WIDTH);
+    ctx.fillStyle = "rgba(90,255,190,0.045)";
+    ctx.fillRect(rightEdge, 0, CW - rightEdge, CH);
+
+    // Слой вещества
+    const grad = ctx.createLinearGradient(slabCanv0, 0, slabCanv1, 0);
+    grad.addColorStop(0, "rgba(80,130,255,0.05)");
+    grad.addColorStop(0.5, "rgba(110,170,255,0.11)");
+    grad.addColorStop(1, "rgba(80,130,255,0.05)");
+
+    ctx.fillStyle = grad;
+    ctx.fillRect(slabCanv0, 0, slabCanv1 - slabCanv0, CH);
+
+    ctx.strokeStyle = "rgba(120,170,255,0.28)";
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(slabCanv0, 1, slabCanv1 - slabCanv0, CH - 2);
+
+    ctx.fillStyle = "rgba(210,225,255,0.75)";
+    ctx.font = "14px system-ui";
+
+    ctx.fillText("Слой вещества", slabCanv0 + 12, 24);
+    ctx.fillText("Детектор отражения", 12, 24);
+    ctx.fillText("Детектор прохождения", CW - 190, 24);
+  }
+
+  function drawAtoms() {
+    for (const atom of atoms) {
+      const heat = Math.min(1, atom.heat / 6);
+      const hue = 220 - 190 * heat;
+      const light = 58 + 20 * heat;
+      const r = 2.4 + Math.min(3, atom.amp * 0.45);
+
+      ctx.fillStyle = `hsla(${hue}, 85%, ${light}%, 0.92)`;
+      ctx.beginPath();
+      ctx.arc(atom.x, atom.y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawPhonons() {
+    for (const ph of phonons) {
+      const alpha = Math.max(0, 1 - ph.r / ph.maxR);
+
+      ctx.strokeStyle = `rgba(120,255,170,${0.35 * alpha})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(ph.x, ph.y, ph.r, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.strokeStyle = `rgba(120,255,170,${0.18 * alpha})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(ph.x, ph.y, ph.r * 0.7, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  function drawPhotons() {
+    ctx.save();
+    ctx.lineCap = "round";
+
+    for (const p of photons) {
+      const color = photonColor(p.energy);
+      const perp = p.angle + Math.PI / 2;
+      const amp = 2 + Math.min(6, p.energy * 0.18);
+      const tail = 18;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 8;
+
+      ctx.beginPath();
+
+      for (let kk = 0; kk < tail; kk++) {
+        const bx = p.x - Math.cos(p.angle) * kk * 2.1;
+        const by = p.y - Math.sin(p.angle) * kk * 2.1;
+        const off = Math.sin(p.phase - kk * 0.55) * amp * (1 - kk / tail);
+
+        const px = bx + Math.cos(perp) * off;
+        const py = by + Math.sin(perp) * off;
+
+        if (kk === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawFlashes() {
+    ctx.save();
+
+    for (const f of flashes) {
+      ctx.globalAlpha = Math.max(0, f.life);
+      ctx.strokeStyle = f.color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawDensityAndPhase() {
+    const baseY = 330;
+    const scale = 190 / Math.max(1e-12, densityScaleMax);
+
+    // Плотность вероятности |psi|^2
+    ctx.beginPath();
+    ctx.moveTo(0, baseY);
+
+    for (let i = 0; i < N; i += 2) {
+      const px = i / (N - 1) * CW;
+      const p = re[i] * re[i] + im[i] * im[i];
+      const h = Math.min(220, p * scale);
+      ctx.lineTo(px, baseY - h);
+    }
+
+    ctx.lineTo(CW, baseY);
+
+    for (let i = N - 2; i >= 0; i -= 2) {
+      const px = i / (N - 1) * CW;
+      const p = re[i] * re[i] + im[i] * im[i];
+      const h = Math.min(220, p * scale);
+      ctx.lineTo(px, baseY + h);
+    }
+
+    ctx.closePath();
+
+    const grad = ctx.createLinearGradient(0, baseY - 220, 0, baseY + 220);
+    grad.addColorStop(0, "rgba(90,240,255,0.30)");
+    grad.addColorStop(0.5, "rgba(70,170,255,0.16)");
+    grad.addColorStop(1, "rgba(90,240,255,0.30)");
+
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    ctx.strokeStyle = "rgba(130,245,255,0.55)";
+    ctx.lineWidth = 1.4;
+    ctx.stroke();
+
+    // Re ψ
+    if (ui.phase.checked) {
+      const realScale = 90 / Math.sqrt(Math.max(1e-12, densityScaleMax));
+
+      ctx.beginPath();
+
+      for (let i = 0; i < N; i += 2) {
+        const px = i / (N - 1) * CW;
+        let val = re[i] * realScale;
+
+        if (val > 220) val = 220;
+        if (val < -220) val = -220;
+
+        const py = baseY - val;
+
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+
+      ctx.strokeStyle = "rgba(255,255,170,0.38)";
+      ctx.lineWidth = 1.2;
+      ctx.stroke();
+    }
+
+    // Центральная линия
+    ctx.strokeStyle = "rgba(200,220,255,0.18)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, baseY);
+    ctx.lineTo(CW, baseY);
+    ctx.stroke();
+  }
+
+  function drawProbabilityBar() {
+    const barX = 16;
+    const barY = 42;
+    const barW = 340;
+    const barH = 18;
+
+    const transmitted = Math.max(0, rightDetected);
+    const reflected = Math.max(0, leftDetected);
+    const absorbed = Math.max(0, materialAbsorbed);
+    const remaining = Math.max(0, currentNorm);
+
+    const total = transmitted + reflected + absorbed + remaining;
+    const denom = total > 1e-12 ? total : 1;
+
+    const segments = [
+      { v: transmitted, c: "#37e6ff", name: "прошло" },
+      { v: reflected, c: "#ffb44d", name: "отразилось" },
+      { v: absorbed, c: "#ff5d5d", name: "поглощено" },
+      { v: remaining, c: "#8a7bff", name: "остаток" }
+    ];
+
+    ctx.fillStyle = "rgba(255,255,255,0.08)";
+    ctx.fillRect(barX, barY, barW, barH);
+
+    let xx = barX;
+
+    for (const seg of segments) {
+      const w = seg.v / denom * barW;
+      ctx.fillStyle = seg.c;
+      ctx.fillRect(xx, barY, w, barH);
+      xx += w;
+    }
+
+    ctx.strokeStyle = "rgba(255,255,255,0.25)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(barX, barY, barW, barH);
+
+    ctx.fillStyle = "rgba(225,235,255,0.9)";
+    ctx.font = "12px system-ui";
+
+    ctx.fillText(
+      `прошло ${(transmitted / denom * 100).toFixed(1)}% | ` +
+      `отразилось ${(reflected / denom * 100).toFixed(1)}% | ` +
+      `поглощено ${(absorbed / denom * 100).toFixed(1)}% | ` +
+      `остаток ${(remaining / denom * 100).toFixed(1)}%`,
+      barX,
+      barY + 34
+    );
+  }
+
+  function drawHUD() {
+    drawProbabilityBar();
+
+    ctx.fillStyle = "rgba(220,230,255,0.72)";
+    ctx.font = "13px system-ui";
+    ctx.fillText(
+      "Плотность вероятности |ψ|² — голубая область; Re ψ — жёлтая линия; фотоны — волнистые линии; фононы — зелёные кольца",
+      16,
+      CH - 16
+    );
+  }
+
+  function draw() {
+    drawBackgroundAndSlab();
+    drawAtoms();
+    drawPhonons();
+    drawDensityAndPhase();
+    drawPhotons();
+    drawFlashes();
+    drawHUD();
+  }
+
+  function updateStatsDOM() {
+    $("stats").innerHTML = [
+      `Текущая норма: <b>${(currentNorm * 100).toFixed(2)}%</b>`,
+      `в слое: <b>${(currentSlab * 100).toFixed(2)}%</b>`,
+      `прошло: <b>${(rightDetected * 100).toFixed(2)}%</b>`,
+      `отразилось: <b>${(leftDetected * 100).toFixed(2)}%</b>`,
+      `поглощено в слое: <b>${(materialAbsorbed * 100).toFixed(2)}%</b>`,
+      `фотонов: <b>${stats.photons}</b>`,
+      `поглощено фотонов: <b>${stats.photonsAbsorbed}</b>`,
+      `фононов: <b>${stats.phonons}</b>`
+    ].join(" | ");
+  }
+
+  // =======================
+  // Главный цикл
+  // =======================
+  function tick() {
+    frame++;
+
+    if (!ui.pause.checked) {
+      update();
+    }
+
+    draw();
+    updateStatsDOM();
+
+    requestAnimationFrame(tick);
+  }
+
+  // =======================
+  // События UI
+  // =======================
+  ui.restart.addEventListener("click", fullReset);
+
+  const sliders = [
+    ui.k,
+    ui.barrier,
+    ui.absorb,
+    ui.thickness,
+    ui.photonGain,
+    ui.phononGain
+  ];
+
+  for (const s of sliders) {
+    s.addEventListener("input", updateLabels);
+    s.addEventListener("change", fullReset);
+  }
+
+  // =======================
+  // Запуск
+  // =======================
+  buildKineticPropagator();
+  fullReset();
+  tick();
+})();
+</script>
+
+</body>
+</html>

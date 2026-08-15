@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Струнное взаимодействие</title>
+<style>
+ body{background:#0d0d14;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#05050a;border:1px solid #333;display:block;margin:8px 0;}
+ .controls{display:flex;gap:14px;flex-wrap:wrap;align-items:center;}
+ #cap{color:#888;font-size:13px;}
+</style>
+</head>
+<body>
+<h2>Классическая модель струнного взаимодействия</h2>
+<div class="controls">
+ <label>скорость: <input id="speed" type="range" min="1" max="6" value="2"> <span id="speedVal">2</span></label>
+ <button id="add">Добавить струну</button>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+<canvas id="sim" width="900" height="520"></canvas>
+<canvas id="sheet" width="900" height="200"></canvas>
+<div id="cap">мировой лист: x по горизонтали, время течёт вверх; слияние/разрыв полос = акты взаимодействия</div>
+<div id="info"></div>
+<script>
+"use strict";
+const sim=document.getElementById('sim'), ctx=sim.getContext('2d');
+const sheet=document.getElementById('sheet'), sctx=sheet.getContext('2d');
+const info=document.getElementById('info');
+const speedEl=document.getElementById('speed'), speedVal=document.getElementById('speedVal');
+const addBtn=document.getElementById('add'), pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+const SW=900, SH=520, HW=900, HH=200;
+
+const tmp=document.createElement('canvas'); tmp.width=HW; tmp.height=HH;
+const tctx=tmp.getContext('2d');
+
+// параметры динамики
+const TENS=0.25, DT=0.5, DAMP=0.9995;
+const R_JOIN=10, R_ATTR=110, K_ATTR=0.02;
+const KW=0.03, MARGIN=25, CD=40;
+
+let strings=[], flashes=[];
+let joins=0, splits=0, recon=0, closes=0;
+let running=true, speed=+speedEl.value;
+let nextId=1, colorIdx=0;
+const COLORS=['#7cff7c','#ff6ec7','#c9a7ff','#ffd43b','#7fd4ff','#ff7b72'];
+function pickColor(){ return COLORS[(colorIdx++)%COLORS.length]; }
+function dist(a,b){ return Math.hypot(a.x-b.x,a.y-b.y); }
+
+function makeOpen(cx,cy,len,ang,mode,amp,vx,vy,color){
+ const n=64, pts=[];
+ const dx=Math.cos(ang), dy=Math.sin(ang), tx=-dy, ty=dx;
+ for(let i=0;i<n;i++){
+  const s=(i/(n-1)-0.5)*len;
+  const d=amp*Math.sin(mode*Math.PI*i/(n-1));
+  pts.push({x:cx+dx*s+tx*d, y:cy+dy*s+ty*d, vx, vy});
+ }
+ return {pts, closed:false, color, cd:0, id:nextId++};
+}
+
+function reset(){
+ strings=[]; flashes=[]; joins=splits=recon=closes=0; nextId=1; colorIdx=0;
+ strings.push(makeOpen(260,210,190,0.35,2,16,+0.6,0,'#00e5ff'));
+ strings.push(makeOpen(640,300,190,-0.4,3,14,-0.6,0,'#ff9f43'));
+ sctx.fillStyle='#05050a'; sctx.fillRect(0,0,HW,HH);
+}
+
+function wallFx(x){ if(x<MARGIN)return KW*(MARGIN-x); if(x>SW-MARGIN)return KW*(SW-MARGIN-x); return 0; }
+function wallFy(y){ if(y<MARGIN)return KW*(MARGIN-y); if(y>SH-MARGIN)return KW*(SH-MARGIN-y); return 0; }
+
+function physStep(){
+ for(const s of strings){
+  const P=s.pts, n=P.length;
+  const ax=new Array(n), ay=new Array(n);
+  for(let i=0;i<n;i++){
+   let axx=0, ayy=0;
+   if(s.closed){
+    const im=(i-1+n)%n, ip=(i+1)%n;
+    axx=TENS*(P[ip].x+P[im].x-2*P[i].x);
+    ayy=TENS*(P[ip].y+P[im].y-2*P[i].y);
+   } else if(i===0){
+    axx=2*TENS*(P[1].x-P[0].x); ayy=2*TENS*(P[1].y-P[0].y);
+   } else if(i===n-1){
+    axx=2*TENS*(P[n-2].x-P[n-1].x); ayy=2*TENS*(P[n-2].y-P[n-1].y);
+   } else {
+    axx=TENS*(P[i+1].x+P[i-1].x-2*P[i].x);
+    ayy=TENS*(P[i+1].y+P[i-1].y-2*P[i].y);
+   }
+   ax[i]=axx; ay[i]=ayy;
+  }
+  for(let i=0;i<n;i++){
+   P[i].vx=(P[i].vx+ax[i]*DT)*DAMP;
+   P[i].vy=(P[i].vy+ay[i]*DT)*DAMP;
+  }
+ }
+ // притяжение концов разных струн
+ const open=strings.filter(s=>!s.closed);
+ for(let a=0;a<open.length;a++)for(let b=a+1;b<open.length;b++){
+  const A=open[a].pts, B=open[b].pts;
+  const ends=[[A[0],B[0]],[A[0],B[B.length-1]],[A[A.length-1],B[0]],[A[A.length-1],B[B.length-1]]];
+  for(const [pa,pb] of ends){
+   const d=dist(pa,pb);
+   if(d<R_ATTR&&d>0.01){
+    const f=K_ATTR*(1-d/R_ATTR)/d;
+    const fx=f*(pb.x-pa.x)*DT, fy=f*(pb.y-pa.y)*DT;
+    pa.vx+=fx; pa.vy+=fy; pb.vx-=fx; pb.vy-=fy;
+   }
+  }
+ }
+ for(const s of strings)for(const p of s.pts){
+  p.vx+=wallFx(p.x)*DT; p.vy+=wallFy(p.y)*DT;
+  p.x+=p.vx*DT; p.y+=p.vy*DT;
+ }
+ for(const s of strings) if(s.cd>0)s.cd--;
+}
+
+function segInt(p1,p2,p3,p4){
+ const d=(p2.x-p1.x)*(p4.y-p3.y)-(p2.y-p1.y)*(p4.x-p3.x);
+ if(Math.abs(d)<1e-9)return null;
+ const t=((p3.x-p1.x)*(p4.y-p3.y)-(p3.y-p1.y)*(p4.x-p3.x))/d;
+ const u=((p3.x-p1.x)*(p2.y-p1.y)-(p3.y-p1.y)*(p2.x-p1.x))/d;
+ if(t>0.02&&t<0.98&&u>0.02&&u<0.98)
+  return {x:p1.x+t*(p2.x-p1.x), y:p1.y+t*(p2.y-p1.y)};
+ return null;
+}
+
+function flash(x,y,color){ flashes.push({x,y,color,age:0}); }
+
+function tryJoin(){
+ const open=strings.filter(s=>!s.closed&&s.cd===0);
+ for(let i=0;i<open.length;i++)for(let j=i+1;j<open.length;j++){
+  const A=open[i], B=open[j];
+  const cand=[[0,0],[0,B.pts.length-1],[A.pts.length-1,0],[A.pts.length-1,B.pts.length-1]];
+  for(const [ia,ib] of cand){
+   const pa=A.pts[ia], pb=B.pts[ib];
+   if(dist(pa,pb)<R_JOIN){
+    let ap=A.pts.slice(), bp=B.pts.slice();
+    if(ia===0)ap.reverse();
+    if(ib===B.pts.length-1)bp.reverse();
+    strings=strings.filter(s=>s!==A&&s!==B);
+    strings.push({pts:ap.concat(bp), closed:false, color:pickColor(), cd:CD, id:nextId++});
+    flash((pa.x+pb.x)/2,(pa.y+pb.y)/2,'#ffffff');
+    joins++; return true;
+   }
+  }
+ }
+ return false;
+}
+
+function tryClose(){
+ for(const s of strings){
+  if(s.closed||s.cd)continue;
+  const n=s.pts.length; if(n<12)continue;
+  const a=s.pts[0], b=s.pts[n-1];
+  if(dist(a,b)<R_JOIN){
+   s.pts[0]={x:(a.x+b.x)/2,y:(a.y+b.y)/2,vx:(a.vx+b.vx)/2,vy:(a.vy+b.vy)/2};
+   s.pts.pop();
+   s.closed=true; s.cd=CD; closes++;
+   flash(s.pts[0].x,s.pts[0].y,s.color);
+   return true;
+  }
+ }
+ return false;
+}
+
+function tryIntercommute(){
+ const open=strings.filter(s=>!s.closed&&s.cd===0);
+ for(let i=0;i<open.length;i++)for(let j=i+1;j<open.length;j++){
+  const A=open[i], B=open[j], PA=A.pts, PB=B.pts;
+  for(let a=0;a<PA.length-1;a++)for(let b=0;b<PB.length-1;b++){
+   const hit=segInt(PA[a],PA[a+1],PB[b],PB[b+1]);
+   if(hit){
+    const X={x:hit.x,y:hit.y,vx:(PA[a].vx+PB[b].vx)/2,vy:(PA[a].vy+PB[b].vy)/2};
+    const p1=PA.slice(0,a+1).concat([{x:X.x,y:X.y,vx:X.vx,vy:X.vy}]).concat(PB.slice(b+1));
+    const p2=PB.slice(0,b+1).concat([{x:X.x,y:X.y,vx:X.vx,vy:X.vy}]).concat(PA.slice(a+1));
+    if(p1.length<6||p2.length<6)return false;
+    strings=strings.filter(s=>s!==A&&s!==B);
+    strings.push({pts:p1,closed:false,color:A.color,cd:CD,id:nextId++});
+    strings.push({pts:p2,closed:false,color:B.color,cd:CD,id:nextId++});
+    flash(hit.x,hit.y,'#ffffff'); recon++; return true;
+   }
+  }
+ }
+ return false;
+}
+
+function makeChild(pts,closed,X,sign){
+ for(const p of pts){
+  const dx=p.x-X.x, dy=p.y-X.y, d=Math.hypot(dx,dy)||1;
+  p.vx+=sign*1.1*dx/d; p.vy+=sign*1.1*dy/d;
+ }
+ strings.push({pts,closed,color:pickColor(),cd:CD,id:nextId++});
+}
+
+function trySelfSplit(){
+ for(const s of strings){
+  if(s.cd)continue;
+  const P=s.pts, n=P.length;
+  if(n<16)continue;
+  const e=s.closed?n:n-1;
+  for(let i=0;i<e;i++)for(let j=i+1;j<e;j++){
+   const gap=j-i;
+   if(s.closed){ if(gap<6||n-gap<6)continue; }
+   else { if(gap<6)continue; if(n-gap+1<6)continue; }
+   const hit=segInt(P[i],P[(i+1)%n],P[j],P[(j+1)%n]);
+   if(hit){
+    if(s.closed){
+     makeChild(P.slice(i,j+1),true,hit,+1);
+     makeChild(P.slice(j+1).concat(P.slice(0,i+1)),true,hit,-1);
+    } else {
+     makeChild(P.slice(i,j+1),true,hit,+1);              // петля
+     makeChild(P.slice(j).concat(P.slice(0,i+1)),false,hit,-1); // остаток
+    }
+    strings=strings.filter(x=>x!==s);
+    flash(hit.x,hit.y,'#ffffff'); splits++; return true;
+   }
+  }
+ }
+ return false;
+}
+
+function interactions(){
+ let did=0;
+ while(did<2){
+  if(tryJoin()){did++;continue;}
+  if(tryClose()){did++;continue;}
+  if(tryIntercommute()){did++;continue;}
+  if(trySelfSplit()){did++;continue;}
+  break;
+ }
+}
+
+function draw(){
+ ctx.fillStyle='#05050a'; ctx.fillRect(0,0,SW,SH);
+ for(let k=flashes.length-1;k>=0;k--){
+  const f=flashes[k]; f.age++;
+  if(f.age>25){flashes.splice(k,1);continue;}
+  ctx.globalAlpha=1-f.age/25;
+  ctx.strokeStyle=f.color; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.arc(f.x,f.y,f.age*3,0,Math.PI*2); ctx.stroke();
+  ctx.globalAlpha=1;
+ }
+ for(const s of strings){
+  ctx.strokeStyle=s.color; ctx.lineWidth=2.5;
+  ctx.shadowColor=s.color; ctx.shadowBlur=10;
+  ctx.beginPath();
+  for(let i=0;i<s.pts.length;i++){
+   const p=s.pts[i];
+   i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y);
+  }
+  if(s.closed)ctx.closePath();
+  ctx.stroke();
+  ctx.shadowBlur=0;
+  if(!s.closed){
+   ctx.fillStyle='#fff';
+   for(const p of [s.pts[0],s.pts[s.pts.length-1]]){
+    ctx.beginPath(); ctx.arc(p.x,p.y,3,0,Math.PI*2); ctx.fill();
+   }
+  }
+ }
+ const open=strings.filter(s=>!s.closed).length;
+ info.textContent=
+  `струн: ${strings.length} (открытых ${open}, замкнутых ${strings.length-open}) | `+
+  `соединений: ${joins} | замыканий: ${closes} | реконнекций: ${recon} | распадов: ${splits}`;
+}
+
+function pushHistory(){
+ tctx.clearRect(0,0,HW,HH);
+ tctx.drawImage(sheet,0,0);
+ sctx.clearRect(0,0,HW,HH);
+ sctx.drawImage(tmp,0,-1);
+ sctx.globalAlpha=0.9;
+ for(const s of strings){
+  sctx.fillStyle=s.color;
+  for(const p of s.pts) sctx.fillRect(p.x|0, HH-1, 1, 1);
+ }
+ sctx.globalAlpha=1;
+}
+
+function frame(){
+ if(running){
+  for(let s=0;s<speed;s++)physStep();
+  interactions();
+  pushHistory();
+ }
+ draw();
+ requestAnimationFrame(frame);
+}
+
+speedEl.addEventListener('input',()=>{speed=+speedEl.value;speedVal.textContent=speed;});
+pauseBtn.addEventListener('click',()=>{running=!running;pauseBtn.textContent=running?'Пауза':'Старт';});
+resetBtn.addEventListener('click',reset);
+addBtn.addEventListener('click',()=>{
+ const cx=120+Math.random()*(SW-240), cy=100+Math.random()*(SH-200);
+ const ang=Math.random()*Math.PI, mode=1+Math.floor(Math.random()*3);
+ const v=(Math.random()-0.5)*1.6;
+ strings.push(makeOpen(cx,cy,150,ang,mode,12,v,-v*0.5,pickColor()));
+});
+
+reset(); frame();
+</script>
+</body>
+</html>

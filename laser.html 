@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Лазер: накачка, инверсия заселенностей, генерация</title>
+<style>
+  html,body{background:#0b0d12;color:#dfe6f3;font-family:system-ui,Segoe UI,Arial;margin:0;padding:14px}
+  h2{text-align:center;font-weight:600;margin:4px 0 10px}
+  .controls{display:flex;gap:18px;align-items:center;justify-content:center;flex-wrap:wrap;margin-bottom:8px;font-size:14px}
+  canvas{display:block;margin:0 auto;background:#05060a;border:1px solid #223;border-radius:10px}
+  button,select{background:#1c2333;color:#dfe6f3;border:1px solid #35405a;border-radius:6px;padding:4px 10px;font-size:14px;cursor:pointer}
+  button:hover{background:#27304a}
+  p.hint{text-align:center;color:#8fa3c8;font-size:13px;margin-top:6px}
+</style>
+</head>
+<body>
+<h2>Оптическая накачка · инверсия заселенностей · вынужденное излучение</h2>
+<div class="controls">
+  <label>Мощность накачки: <input id="pump" type="range" min="0" max="100" value="60"></label>
+  <label>Схема:
+    <select id="scheme">
+      <option value="3">3 уровня (как рубиновый лазер)</option>
+      <option value="4">4 уровня (как Nd:YAG)</option>
+    </select>
+  </label>
+  <button id="pause">Пауза</button>
+  <button id="reset">Сброс</button>
+</div>
+<canvas id="c" width="1120" height="640"></canvas>
+<p class="hint">Фиолетовые фотоны — накачка; красные — лазерное излучение. Вынужденные фотоны — точные копии стимулирующего (та же фаза и направление). Зелёные атомы — метастабильный уровень E2.</p>
+
+<script>
+'use strict';
+/* =========================================================
+   Агентная модель лазера. Вероятности событий соответствуют
+   скоростным уравнениям:
+     dN2/dt = N3/τ32 − N2/τ21 − B·ρ·(N2−N1)
+     dρ/dt  = B·ρ·(N2−N1) − ρ/τc + спонтанный вклад
+   Времена условные (анимационные), топология процессов — реальная.
+   ========================================================= */
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+const W=cv.width,H=cv.height;
+const cav={x0:330,x1:1060,y0:185,y1:395};
+
+const N_ATOMS=150, R_RIGHT=0.90;     // выходное зеркало R=90%
+const P_ABS=0.15, P_STIM=0.09, A_SPON=0.003;
+const K_32=0.30, K_10=0.35;          // безызлучательная релаксация, уход с нижнего уровня
+const C_LIGHT=6, MAX_PHOTONS=1200;
+
+let scheme=3,pumpPower=60,paused=false;
+let atoms=[],photons=[],rings=[],sparks=[];
+let hist={inv:[],ph:[],out:[]};
+let counts={0:0,1:0,2:0,3:0};
+let ev={pump:0,relax:0,spon:0,stim:0};
+let outEMA=0,outAccum=0,tick=0;
+const ground=()=>scheme===3?1:0;
+
+function reset(){
+  atoms=[];photons=[];rings=[];sparks=[];
+  hist={inv:[],ph:[],out:[]}; outEMA=0;outAccum=0;
+  const g=ground();
+  for(let i=0;i<N_ATOMS;i++)
+    atoms.push({x:cav.x0+18+Math.random()*(cav.x1-cav.x0-36),
+                y:cav.y0+14+Math.random()*(cav.y1-cav.y0-28), s:g});
+}
+
+/* ---------------- шаг модели ---------------- */
+function step(){
+  tick++;
+  // 1) лампа накачки
+  const rate=pumpPower/100*3.4;
+  let n=(rate|0)+(Math.random()<rate%1?1:0);
+  while(n-->0)photons.push({x:cav.x0+Math.random()*(cav.x1-cav.x0),y:cav.y0-24,
+    vx:(Math.random()-.5)*.6,vy:C_LIGHT*.6,kind:0});
+
+  // 2) атомы: релаксация E3→E2, спонтанное излучение E2→E1(нижний)
+  for(const a of atoms){
+    if(a.s===3){
+      if(Math.random()<K_32){a.s=2;ev.relax++;sparks.push({x:a.x,y:a.y,life:16});}
+    }else if(a.s===2){
+      if(Math.random()<A_SPON){
+        a.s=1;ev.spon++;
+        const ang=Math.random()*Math.PI*2;
+        photons.push({x:a.x,y:a.y,vx:Math.cos(ang)*C_LIGHT,vy:Math.sin(ang)*C_LIGHT,kind:1});
+        rings.push({x:a.x,y:a.y,r:3,life:22,c:'255,150,90'});
+      }
+    }else if(a.s===1&&scheme===4){
+      if(Math.random()<K_10)a.s=0;   // быстрое опустошение нижнего уровня
+    }
+  }
+
+  // 3) фотоны: поглощение накачки, вынужденное излучение, зеркала
+  const born=[];
+  for(const p of photons){
+    p.x+=p.vx;p.y+=p.vy;
+
+    if(p.kind===0){ // фотон накачки
+      if(p.y>cav.y0-8){
+        for(const a of atoms){
+          if(a.s!==ground())continue;
+          const dx=a.x-p.x,dy=a.y-p.y;
+          if(dx*dx+dy*dy<169&&Math.random()<P_ABS){
+            a.s=3;ev.pump++;p.dead=1;
+            rings.push({x:a.x,y:a.y,r:3,life:16,c:'178,142,255'});
+            break;
+          }
+        }
+      }
+      if(p.y>cav.y1+10||p.x<cav.x0-30||p.x>cav.x1+30)p.dead=1;
+      continue;
+    }
+    if(p.out){if(p.x>W+30)p.dead=1;continue;}
+
+    // вынужденное излучение: рождается фотон-клон (та же фаза, направление)
+    if(photons.length+born.length<MAX_PHOTONS){
+      for(const a of atoms){
+        if(a.s!==2)continue;
+        const dx=a.x-p.x,dy=a.y-p.y;
+        if(dx*dx+dy*dy<121&&Math.random()<P_STIM){
+          a.s=1;ev.stim++;
+          born.push({x:a.x,y:a.y,vx:p.vx,vy:p.vy,kind:1});
+          rings.push({x:a.x,y:a.y,r:3,life:22,c:'255,70,70'});
+        }
+      }
+    }
+    // зеркала
+    if(p.y>cav.y0&&p.y<cav.y1){
+      if(p.x<cav.x0){p.x=2*cav.x0-p.x;p.vx=Math.abs(p.vx);}
+      else if(p.x>cav.x1){
+        if(Math.random()<R_RIGHT){p.x=2*cav.x1-p.x;p.vx=-Math.abs(p.vx);}
+        else{p.out=1;outEMA++;outAccum++;}
+      }
+    }else if(p.y<cav.y0-4||p.y>cav.y1+4){p.dead=1;} // ушёл из моды поперёк
+    if(p.x<cav.x0-60||p.x>cav.x1+60)p.dead=1;
+  }
+  photons=photons.filter(p=>!p.dead).concat(born);
+
+  for(const r of rings){r.r+=1.4;r.life--;}
+  rings=rings.filter(r=>r.life>0);
+  for(const s of sparks)s.life--;
+  sparks=sparks.filter(s=>s.life>0);
+
+  counts={0:0,1:0,2:0,3:0};
+  for(const a of atoms)counts[a.s]++;
+  outEMA*=.965;
+  for(const k in ev)ev[k]*=.9;
+
+  if(tick%4===0){
+    const den=counts[2]+counts[1];
+    hist.inv.push(den?counts[2]/den:0);
+    hist.ph.push(photons.reduce((q,p)=>q+(p.kind===1&&!p.out?1:0),0));
+    hist.out.push(outAccum); outAccum=0;
+    if(hist.inv.length>240){hist.inv.shift();hist.ph.shift();hist.out.shift();}
+  }
+}
+
+/* ---------------- отрисовка ---------------- */
+function roundRect(x,y,w,h,r,fill,stroke){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();
+  if(fill){ctx.fillStyle=fill;ctx.fill();}
+  if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=1.5;ctx.stroke();}
+}
+function arrow(x1,y1,x2,y2,col,alpha,lab){
+  ctx.globalAlpha=Math.max(.25,Math.min(1,alpha));
+  ctx.strokeStyle=col;ctx.fillStyle=col;ctx.lineWidth=2;
+  ctx.beginPath();ctx.moveTo(x1,y1);ctx.lineTo(x2,y2);ctx.stroke();
+  const ang=Math.atan2(y2-y1,x2-x1),s=7;
+  ctx.beginPath();ctx.moveTo(x2,y2);
+  ctx.lineTo(x2-s*Math.cos(ang-.5),y2-s*Math.sin(ang-.5));
+  ctx.lineTo(x2-s*Math.cos(ang+.5),y2-s*Math.sin(ang+.5));
+  ctx.closePath();ctx.fill();
+  if(lab){ctx.font='11px system-ui';ctx.fillText(lab,x1+6,(y1+y2)/2);}
+  ctx.globalAlpha=1;
+}
+function wavy(x1,y1,x2,y2,col,alpha,lab){
+  ctx.globalAlpha=Math.max(.25,Math.min(1,alpha));
+  ctx.strokeStyle=col;ctx.lineWidth=1.8;ctx.beginPath();
+  for(let i=0;i<=14;i++){const t=i/14,yy=y1+(y2-y1)*t,xx=x1+Math.sin(t*Math.PI*4)*5;
+    i?ctx.lineTo(xx,yy):ctx.moveTo(xx,yy);}
+  ctx.stroke();
+  if(lab){ctx.fillStyle=col;ctx.font='11px system-ui';ctx.fillText(lab,x1+8,(y1+y2)/2);}
+  ctx.globalAlpha=1;
+}
+
+function drawLamp(){
+  const g=pumpPower/100;
+  const grd=ctx.createLinearGradient(0,cav.y0-52,0,cav.y0-8);
+  grd.addColorStop(0,'rgba(150,110,255,0)');
+  grd.addColorStop(1,`rgba(170,130,255,${.12+.45*g})`);
+  ctx.fillStyle=grd;ctx.fillRect(cav.x0,cav.y0-52,cav.x1-cav.x0,46);
+  roundRect(cav.x0,cav.y0-46,cav.x1-cav.x0,20,9,'rgba(60,40,110,.9)',
+    `rgba(${150+105*g|0},${110+80*g|0},255,${.35+.6*g})`);
+  ctx.fillStyle='#b9a8ff';ctx.font='12px system-ui';
+  ctx.fillText('Лампа накачки (фиолетовые фотоны hν₃)',cav.x0+6,cav.y0-56);
+}
+function drawCavity(){
+  const den=counts[2]+counts[1], inv=den?counts[2]/den:0;
+  ctx.fillStyle=`rgba(150,30,40,${.10+.15*inv})`;
+  ctx.fillRect(cav.x0,cav.y0,cav.x1-cav.x0,cav.y1-cav.y0);
+  ctx.strokeStyle='#33415c';ctx.lineWidth=1.5;
+  ctx.strokeRect(cav.x0,cav.y0,cav.x1-cav.x0,cav.y1-cav.y0);
+  ctx.fillStyle='rgba(180,195,225,.55)';ctx.font='12px system-ui';
+  ctx.fillText('активная среда / оптический резонатор',(cav.x0+cav.x1)/2-110,cav.y1-10);
+}
+function drawMirrors(){
+  let mg=ctx.createLinearGradient(cav.x0-14,0,cav.x0,0);
+  mg.addColorStop(0,'#39445e');mg.addColorStop(1,'#cdd9ee');
+  ctx.fillStyle=mg;ctx.fillRect(cav.x0-14,cav.y0-8,14,cav.y1-cav.y0+16);
+  mg=ctx.createLinearGradient(cav.x1,0,cav.x1+14,0);
+  mg.addColorStop(0,'rgba(205,217,238,.95)');mg.addColorStop(1,'rgba(205,217,238,.35)');
+  ctx.fillStyle=mg;ctx.fillRect(cav.x1,cav.y0-8,14,cav.y1-cav.y0+16);
+  ctx.fillStyle='#9fb2d4';ctx.font='12px system-ui';ctx.textAlign='center';
+  ctx.fillText('R = 100%',cav.x0-7,cav.y1+18);
+  ctx.fillText('R = 90%',cav.x1+7,cav.y1+18);
+  ctx.textAlign='left';
+}
+function drawAtoms(){
+  for(const a of atoms){
+    let col;
+    if(a.s===2)col='#79f279';
+    else if(a.s===3)col='#b48cff';
+    else if(scheme===4)col=a.s===0?'#67809f':'#ffab52';
+    else col='#8fb4e8';
+    if(a.s===2){ctx.fillStyle='rgba(121,242,121,.18)';
+      ctx.beginPath();ctx.arc(a.x,a.y,10,0,7);ctx.fill();}
+    ctx.fillStyle=col;
+    ctx.beginPath();ctx.arc(a.x,a.y,4.6,0,7);ctx.fill();
+  }
+}
+function drawPhotons(){
+  ctx.lineCap='round';
+  for(const p of photons){
+    if(p.kind===0){ctx.strokeStyle='rgba(178,142,255,.85)';ctx.lineWidth=1.6;}
+    else{ctx.strokeStyle=p.out?'rgba(255,70,70,1)':'rgba(255,80,80,.9)';
+         ctx.lineWidth=p.out?2.6:1.8;}
+    ctx.beginPath();ctx.moveTo(p.x-p.vx*2.3,p.y-p.vy*2.3);ctx.lineTo(p.x,p.y);ctx.stroke();
+  }
+}
+function drawEffects(){
+  for(const r of rings){ctx.strokeStyle=`rgba(${r.c},${Math.max(0,r.life)/22*.9})`;
+    ctx.lineWidth=1.4;ctx.beginPath();ctx.arc(r.x,r.y,r.r,0,7);ctx.stroke();}
+  for(const s of sparks){ctx.fillStyle=`rgba(255,170,60,${s.life/16})`;
+    ctx.beginPath();ctx.arc(s.x,s.y,2.2,0,7);ctx.fill();}
+}
+function drawBeam(){
+  const b=Math.min(1,outEMA/25);
+  if(b>0.02){
+    const g=ctx.createLinearGradient(cav.x1+14,0,W,0);
+    g.addColorStop(0,`rgba(255,60,60,${.55*b})`);g.addColorStop(1,'rgba(255,60,60,0)');
+    const bh=4+26*b,cy=(cav.y0+cav.y1)/2;
+    ctx.fillStyle=g;ctx.fillRect(cav.x1+14,cy-bh/2,W-cav.x1-14,bh);
+  }
+}
+function drawMeter(){
+  const den=counts[2]+counts[1],inv=den?counts[2]/den:0;
+  const x=cav.x0,y=64,w=340,h=14;
+  ctx.fillStyle='#9fb2d4';ctx.font='12px system-ui';
+  ctx.fillText('Заселенность верхнего рабочего уровня N2/(N1+N2):',x,y-6);
+  ctx.fillStyle='#141a28';ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle='#33415c';ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle=inv>.5?'#5dff7f':'#ffb14a';ctx.fillRect(x,y,w*inv,h);
+  ctx.strokeStyle='#ff5050';ctx.setLineDash([3,3]);
+  ctx.beginPath();ctx.moveTo(x+w/2,y-3);ctx.lineTo(x+w/2,y+h+3);ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle=inv>.5?'#5dff7f':'#ffb14a';
+  ctx.fillText(inv>.5?'ИНВЕРСИЯ ДОСТИГНУТА':'инверсии пока нет',x+w+12,y+11);
+}
+function plot(arr,gx,gy,gw,gh,norm,col){
+  if(arr.length<2)return;
+  ctx.strokeStyle=col;ctx.lineWidth=1.6;ctx.beginPath();
+  const stepX=gw/239;
+  for(let i=0;i<arr.length;i++){
+    const x=gx+gw-(arr.length-1-i)*stepX,y=gy+gh-norm(arr[i])*gh;
+    i?ctx.lineTo(x,y):ctx.moveTo(x,y);
+  }
+  ctx.stroke();
+}
+function drawGraph(){
+  const gx=330,gy=470,gw=730,gh=150;
+  roundRect(gx-12,gy-26,gw+24,gh+44,10,'rgba(20,26,40,.75)','#2c3a55');
+  ctx.fillStyle='#cfdaf0';ctx.font='13px system-ui';
+  ctx.fillText('Динамика:',gx,gy-8);
+  ctx.strokeStyle='#22304a';
+  for(let i=0;i<=4;i++){const y=gy+gh*i/4;
+    ctx.beginPath();ctx.moveTo(gx,y);ctx.lineTo(gx+gw,y);ctx.stroke();}
+  ctx.strokeStyle='rgba(255,80,80,.4)';ctx.setLineDash([4,4]);
+  ctx.beginPath();ctx.moveTo(gx,gy+gh*.5);ctx.lineTo(gx+gw,gy+gh*.5);ctx.stroke();
+  ctx.setLineDash([]);
+  plot(hist.inv,gx,gy,gw,gh,v=>v,'#5dff7f');
+  plot(hist.ph,gx,gy,gw,gh,v=>Math.min(1,v/400),'#ff5050');
+  plot(hist.out,gx,gy,gw,gh,v=>Math.min(1,v/30),'#ffb14a');
+  const leg=[['инверсия N2/(N1+N2)','#5dff7f'],['фотоны в резонаторе','#ff5050'],['выходная мощность','#ffb14a']];
+  let lx=gx+150;ctx.font='11px system-ui';
+  for(const[t,c]of leg){ctx.fillStyle=c;ctx.fillRect(lx,gy-14,14,3);
+    ctx.fillStyle='#9fb2d4';ctx.fillText(t,lx+18,gy-9);lx+=ctx.measureText(t).width+40;}
+}
+function drawLevels(){
+  const px=18,pw=288;
+  roundRect(px,120,pw,392,10,'rgba(20,26,40,.75)','#2c3a55');
+  ctx.fillStyle='#cfdaf0';ctx.font='13px system-ui';
+  ctx.fillText('Уровни энергии и заселенности',px+14,142);
+  const L=scheme===3
+    ?[{lab:'E3 · полоса накачки',y:190,st:3},
+      {lab:'E2 · метастабильный',y:290,st:2},
+      {lab:'E1 · основной',y:470,st:1}]
+    :[{lab:'E3 · полоса накачки',y:180,st:3},
+      {lab:'E2 · метастабильный',y:270,st:2},
+      {lab:'E1 · нижний рабочий',y:370,st:1},
+      {lab:'E0 · основной',y:470,st:0}];
+  const x0=px+16,x1=px+pw-16;
+  for(const lv of L){
+    ctx.strokeStyle='#5a6c8f';ctx.lineWidth=2;
+    ctx.beginPath();ctx.moveTo(x0,lv.y);ctx.lineTo(x1,lv.y);ctx.stroke();
+    ctx.fillStyle='#93a5c6';ctx.font='11px system-ui';ctx.fillText(lv.lab,x0,lv.y-6);
+    const n=counts[lv.st],w=(x1-x0)*n/N_ATOMS;
+    ctx.fillStyle=lv.st===2?'rgba(121,242,121,.8)':lv.st===3?'rgba(180,140,255,.8)':'rgba(143,180,232,.8)';
+    ctx.fillRect(x0,lv.y-4,w,4);
+    ctx.fillStyle='#dfe6f3';ctx.fillText('N='+n,x1-38,lv.y+14);
+  }
+  const gLv=scheme===3?L[2]:L[3];
+  arrow(x0+30,gLv.y,x0+30,L[0].y,'#b48cff',Math.min(1,ev.pump/8),'hν₃');
+  wavy(x0+110,L[0].y,x0+110,L[1].y,'#ffab52',Math.min(1,ev.relax/8),'тепло');
+  arrow(x0+200,L[1].y,x0+200,L[2].y,'#ff5050',Math.min(1,(ev.stim+ev.spon)/8),'hν лазера');
+  if(scheme===4)arrow(x0+245,L[2].y,x0+245,L[3].y,'#7fd0ff',.5,'быстрый уход');
+}
+function draw(){
+  ctx.fillStyle='#05060a';ctx.fillRect(0,0,W,H);
+  drawLamp();drawCavity();drawPhotons();drawAtoms();drawEffects();
+  drawMirrors();drawBeam();drawLevels();drawMeter();drawGraph();
+}
+
+/* ---------------- управление и цикл ---------------- */
+document.getElementById('pump').oninput=e=>pumpPower=+e.target.value;
+document.getElementById('scheme').onchange=e=>{scheme=+e.target.value;reset();};
+document.getElementById('reset').onclick=reset;
+document.getElementById('pause').onclick=function(){paused=!paused;this.textContent=paused?'Продолжить':'Пауза';};
+
+reset();
+(function frame(){
+  if(!paused)step();
+  draw();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

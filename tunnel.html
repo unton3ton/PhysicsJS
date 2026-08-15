@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Туннелирование в чёрной дыре</title>
+<style>
+ body{background:#111;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#000;border:1px solid #333;display:block;margin:8px 0;}
+ .controls{display:flex;gap:14px;flex-wrap:wrap;align-items:center;}
+</style>
+</head>
+<body>
+<h2>Скалярное поле в метрике Шварцшильда: барьер + горизонт</h2>
+<div class="controls">
+ <label>k₀: <input id="k0" type="range" min="0.2" max="1.2" step="0.01" value="0.5"> <span id="k0Val">0.50</span></label>
+ <label>шагов/кадр: <input id="steps" type="range" min="1" max="60" value="20"> <span id="stepsVal">20</span></label>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+<canvas id="wave" width="900" height="260"></canvas>
+<canvas id="phys" width="900" height="160"></canvas>
+<div id="info"></div>
+<script>
+"use strict";
+const wave=document.getElementById('wave'), wctx=wave.getContext('2d');
+const phys=document.getElementById('phys'), pctx=phys.getContext('2d');
+const info=document.getElementById('info');
+const k0El=document.getElementById('k0'), k0Val=document.getElementById('k0Val');
+const stepsEl=document.getElementById('steps'), stepsVal=document.getElementById('stepsVal');
+const pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+const N=1024;
+const RSMIN=-14, RSMAX=70;
+const dx=(RSMAX-RSMIN)/(N-1);
+const dt=0.45*dx;
+let stepsPerFrame=+stepsEl.value, running=true, time=0;
+let k0=+k0El.value;
+
+const phi=new Float64Array(N), pi=new Float64Array(N);
+const V=new Float64Array(N), rOfX=new Float64Array(N);
+const sL=new Float64Array(N), sR=new Float64Array(N);
+let E0=1, fallen=0, escaped=0, iPeak=0, Vmax=0;
+
+function rFromTortoise(rs){
+  let r = rs>3 ? rs-Math.log(rs) : 1+Math.exp(rs-1);
+  for(let it=0;it<60;it++){
+    if(r<=1+1e-6) r=1+1e-6;
+    const f=r+Math.log(r-1)-rs;
+    const fp=1+1/(r-1);
+    const dr=f/fp; r-=dr;
+    if(Math.abs(dr)<1e-10) break;
+  }
+  return Math.max(r,1+1e-6);
+}
+
+function build(){
+  Vmax=0;
+  for(let i=0;i<N;i++){
+    const rs=RSMIN+i*dx;
+    const r=rFromTortoise(rs);
+    rOfX[i]=r;
+    V[i]=(1-1/r)*(2/(r*r)+1/(r*r*r)); // l=1, rs=1
+    if(V[i]>Vmax){Vmax=V[i]; iPeak=i;}
+  }
+  const w=60;
+  for(let i=0;i<N;i++){
+    const l=i<w?(w-i)/w:0, r=i>N-1-w?(i-(N-1-w))/w:0;
+    sL[i]=3*l*l; sR[i]=3*r*r;
+  }
+}
+
+function init(){
+  build();
+  time=0; fallen=0; escaped=0;
+  const x0=45, sigma=3.0;
+  for(let i=0;i<N;i++){
+    const x=RSMIN+i*dx;
+    const g=Math.exp(-((x-x0)*(x-x0))/(4*sigma*sigma));
+    phi[i]=g*Math.cos(k0*(x-x0));
+    const dg=-(x-x0)/(2*sigma*sigma)*g;
+    pi[i]=dg*Math.cos(k0*(x-x0))-g*k0*Math.sin(k0*(x-x0)); // влево
+  }
+  E0=energy();
+}
+
+function energy(){
+  let E=0;
+  for(let i=1;i<N-1;i++){
+    const phx=(phi[i+1]-phi[i-1])/(2*dx);
+    E+=pi[i]*pi[i]+phx*phx+V[i]*phi[i]*phi[i];
+  }
+  return E*dx;
+}
+
+function step(){
+  for(let i=1;i<N-1;i++){
+    const d2=(phi[i+1]-2*phi[i]+phi[i-1])/(dx*dx);
+    pi[i]+=dt*(d2-V[i]*phi[i]);
+    pi[i]-=dt*(sL[i]+sR[i])*pi[i];
+    fallen+=dt*sL[i]*pi[i]*pi[i]*dx;
+    escaped+=dt*sR[i]*pi[i]*pi[i]*dx;
+  }
+  for(let i=1;i<N-1;i++) phi[i]+=dt*pi[i];
+  phi[0]=phi[N-1]=0; pi[0]=pi[N-1]=0;
+  time+=dt;
+}
+
+function draw(){
+  const W=wave.width,H=wave.height,base=H*0.62;
+  wctx.fillStyle='#000'; wctx.fillRect(0,0,W,H);
+  let g=wctx.createLinearGradient(0,0,70,0);
+  g.addColorStop(0,'rgba(255,60,60,0.4)'); g.addColorStop(1,'rgba(255,60,60,0)');
+  wctx.fillStyle=g; wctx.fillRect(0,0,70,H);
+  wctx.fillStyle='#f66'; wctx.fillText('горизонт',8,16);
+  wctx.fillStyle='#888'; wctx.fillText('r* → +∞',W-70,16);
+
+  wctx.strokeStyle='#ffd43b'; wctx.beginPath();
+  for(let i=0;i<N;i+=2){
+    const x=i/(N-1)*W, y=base-V[i]*220;
+    i?wctx.lineTo(x,y):wctx.moveTo(x,y);
+  }
+  wctx.stroke();
+
+  wctx.strokeStyle='#00e5ff'; wctx.beginPath();
+  for(let i=0;i<N;i++){
+    const x=i/(N-1)*W, y=base-phi[i]*120;
+    i?wctx.lineTo(x,y):wctx.moveTo(x,y);
+  }
+  wctx.stroke();
+
+  // физическая координата r: плотность с якобианом dr*/dr
+  const PW=phys.width,PH=phys.height;
+  pctx.fillStyle='#000'; pctx.fillRect(0,0,PW,PH);
+  const rMax=40, bins=new Float64Array(PW);
+  for(let i=1;i<N-1;i++){
+    const r=rOfX[i]; if(r>rMax) continue;
+    const x=Math.floor((r-1)/(rMax-1)*(PW-1));
+    const jac=1/Math.max(1-1/r,1e-3);
+    bins[x]+=phi[i]*phi[i]*jac;
+  }
+  let bm=0; for(let b=0;b<PW;b++) bm=Math.max(bm,bins[b]);
+  pctx.strokeStyle='#7cf'; pctx.beginPath();
+  for(let b=0;b<PW;b++){
+    const y=PH-4-(bins[b]/(bm||1))*(PH-20);
+    b?pctx.lineTo(b,y):pctx.moveTo(b,y);
+  }
+  pctx.stroke();
+  pctx.fillStyle='#888'; pctx.fillText('плотность по физической r (накопление у горизонта)',8,14);
+
+  info.textContent=
+   `t=${time.toFixed(1)} | ω²=k₀²=${(k0*k0).toFixed(2)} | Vmax=${Vmax.toFixed(2)} | `+
+   `упало в дыру: ${(100*fallen/E0).toFixed(1)}% | ушло в ∞: ${(100*escaped/E0).toFixed(1)}%`;
+}
+
+function frame(){
+  if(running) for(let s=0;s<stepsPerFrame;s++) step();
+  draw();
+  requestAnimationFrame(frame);
+}
+
+k0El.addEventListener('input',()=>{k0=+k0El.value;k0Val.textContent=k0.toFixed(2);init();});
+stepsEl.addEventListener('input',()=>{stepsPerFrame=+stepsEl.value;stepsVal.textContent=stepsEl.value;});
+pauseBtn.addEventListener('click',()=>{running=!running;pauseBtn.textContent=running?'Пауза':'Старт';});
+resetBtn.addEventListener('click',init);
+
+init(); frame();
+</script>
+</body>
+</html>

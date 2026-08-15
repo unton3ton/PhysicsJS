@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Электронный поток и микроскопическая чёрная дыра</title>
+<style>
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    padding: 14px;
+    background: #02030a;
+    color: #d9e5ff;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+
+  h1 {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 650;
+  }
+
+  .panel {
+    width: 1180px;
+    max-width: 97vw;
+    background: #080d1c;
+    border: 1px solid #24365f;
+    border-radius: 14px;
+    padding: 10px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 16px;
+    align-items: center;
+  }
+
+  button {
+    background: #15305e;
+    color: #eaf2ff;
+    border: 1px solid #3d5c99;
+    border-radius: 10px;
+    padding: 8px 12px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+
+  button:hover {
+    background: #1c3d76;
+  }
+
+  label {
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    white-space: nowrap;
+  }
+
+  input[type="range"] {
+    width: 105px;
+  }
+
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+  }
+
+  canvas {
+    border: 1px solid #24365f;
+    border-radius: 14px;
+    background: #02030a;
+    max-width: 97vw;
+  }
+
+  #info {
+    width: 1180px;
+    max-width: 97vw;
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: #c7d8ff;
+  }
+
+  .hint {
+    width: 1180px;
+    max-width: 97vw;
+    color: #8fa4d6;
+    font-size: 13px;
+    line-height: 1.55;
+  }
+
+  .val {
+    color: #8ff0ff;
+    min-width: 96px;
+    display: inline-block;
+  }
+</style>
+</head>
+<body>
+
+<h1>Взаимодействие электронного потока и микроскопической чёрной дыры</h1>
+
+<div class="panel">
+  <button id="restartBtn">Сброс</button>
+
+  <label class="check">
+    <input id="pauseChk" type="checkbox">
+    Пауза
+  </label>
+
+  <label class="check">
+    <input id="chargeChk" type="checkbox" checked>
+    Заряд ЧД
+  </label>
+
+  <label class="check">
+    <input id="dischargeChk" type="checkbox" checked>
+    Разрядка Хокинга
+  </label>
+
+  <label class="check">
+    <input id="hawkingChk" type="checkbox" checked>
+    Излучение Хокинга
+  </label>
+
+  <label class="check">
+    <input id="lensChk" type="checkbox" checked>
+    Линзирование
+  </label>
+
+  <label>
+    Масса ЧД
+    <span id="massVal" class="val"></span>
+    <input id="massRange" type="range" min="8" max="14" step="0.1" value="12">
+  </label>
+
+  <label>
+    Энергия e⁻
+    <span id="energyVal" class="val"></span>
+    <input id="energyRange" type="range" min="3" max="9" step="0.1" value="9">
+  </label>
+
+  <label>
+    Поток
+    <span id="fluxVal" class="val"></span>
+    <input id="fluxRange" type="range" min="0" max="8" step="0.1" value="2.5">
+  </label>
+
+  <label>
+    Ширина пучка
+    <span id="beamVal" class="val"></span>
+    <input id="beamRange" type="range" min="1" max="18" step="0.5" value="8">
+  </label>
+
+  <label>
+    Скорость сим.
+    <span id="speedVal" class="val"></span>
+    <input id="speedRange" type="range" min="0.2" max="3" step="0.1" value="1">
+  </label>
+</div>
+
+<canvas id="view" width="1180" height="620"></canvas>
+
+<div id="info"></div>
+
+<div class="hint">
+  Модель качественная, но старается быть физически осмысленной:
+  горизонт событий, фотонная сфера, захват электронов, накопление отрицательного заряда ЧД,
+  кулоновское отталкивание, излучение Хокинга, температура и время жизни.
+  Длина волн электрона сравнивается с радиусом Шварцшильда: если λ_e &gt; r_s,
+  классические траектории становятся условными. Масштаб изображения растянут: визуальный радиус ЧД фиксирован,
+  а физический масштаб показан внизу справа.
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById("view");
+  const ctx = canvas.getContext("2d");
+  const CW = canvas.width;
+  const CH = canvas.height;
+
+  const $ = id => document.getElementById(id);
+
+  const ui = {
+    restart: $("restartBtn"),
+    pause: $("pauseChk"),
+    charge: $("chargeChk"),
+    discharge: $("dischargeChk"),
+    hawking: $("hawkingChk"),
+    lens: $("lensChk"),
+    massExp: $("massRange"),
+    energyExp: $("energyRange"),
+    flux: $("fluxRange"),
+    beam: $("beamRange"),
+    speed: $("speedRange")
+  };
+
+  // ===========================
+  // Физические константы (SI)
+  // ===========================
+  const CONST = {
+    c: 299792458,
+    G: 6.67430e-11,
+    hbar: 1.054571817e-34,
+    kB: 1.380649e-23,
+    e: 1.602176634e-19,
+    me: 9.1093837015e-31,
+    h: 6.62607015e-34,
+    ke: 8.9875517923e9
+  };
+
+  const ELECTRON_REST_EV = 510998.95;
+  const HC_EV_NM = 1239.841984;
+
+  // Отношение кулоновской силы к гравитационной для заряда ЧД = 1e
+  // и электрона: F_e / F_g = ke * e^2 / (G * M * me) = CHARGE_CONST / M
+  const CHARGE_CONST = CONST.ke * CONST.e * CONST.e / (CONST.G * CONST.me);
+
+  // ===========================
+  // Визуальные параметры
+  // ===========================
+  const rsPx = 14;             // визуальный радиус горизонта в пикселях
+  const cx = CW / 2;
+  const cy = CH / 2;
+
+  const CAPTURE_R = 1.03;      // в единицах r_s
+  const PHOTON_SPHERE_R = 1.5; // 1.5 r_s
+  const ISCO_R = 3.0;          // 3 r_s для массивных частиц
+
+  // ===========================
+  // Состояние симуляции
+  // ===========================
+  let stars = [];
+  let electrons = [];
+  let hawkingPhotons = [];
+  let flashes = [];
+
+  let stats = {
+    emitted: 0,
+    captured: 0,
+    passed: 0,
+    left: 0,
+    lost: 0,
+    hawking: 0
+  };
+
+  let bhChargeE = 0; // заряд ЧД в единицах элементарного заряда; отрицательный = избыток электронов
+  let frame = 0;
+
+  let currentM = 1e12;
+  let currentK = 1e9;
+  let currentBeta = 1;
+  let rsPhys = 0;
+  let lambdaPhys = 0;
+
+  // ===========================
+  // Физические формулы
+  // ===========================
+  function schwarzschildRadius(M) {
+    return 2 * CONST.G * M / (CONST.c * CONST.c);
+  }
+
+  function hawkingTemp(M) {
+    return CONST.hbar * Math.pow(CONST.c, 3) /
+      (8 * Math.PI * CONST.G * M * CONST.kB);
+  }
+
+  function hawkingPower(M) {
+    return CONST.hbar * Math.pow(CONST.c, 6) /
+      (15360 * Math.PI * CONST.G * CONST.G * M * M);
+  }
+
+  function hawkingLifetime(M) {
+    return 5120 * Math.PI * CONST.G * CONST.G * Math.pow(M, 3) /
+      (CONST.hbar * Math.pow(CONST.c, 4));
+  }
+
+  function hawkingPhotonEnergyEV(M) {
+    return CONST.kB * hawkingTemp(M) / CONST.e;
+  }
+
+  function electronBeta(K_eV) {
+    const gamma = 1 + K_eV / ELECTRON_REST_EV;
+    return Math.sqrt(Math.max(0, 1 - 1 / (gamma * gamma)));
+  }
+
+  function deBroglieWavelength(K_eV) {
+    const p_eVc = Math.sqrt(K_eV * (K_eV + 2 * ELECTRON_REST_EV));
+    return HC_EV_NM * 1e-9 / p_eVc;
+  }
+
+  function chargeRatioPerElectron(M) {
+    return CHARGE_CONST / M;
+  }
+
+  // ===========================
+  // Форматирование чисел
+  // ===========================
+  function formatSci(v, unit = "") {
+    if (!isFinite(v)) return "∞";
+    if (v === 0) return "0";
+
+    const abs = Math.abs(v);
+    const exp = Math.floor(Math.log10(abs));
+    const mant = v / Math.pow(10, exp);
+
+    return `${mant.toFixed(3)}·10^${exp}${unit ? " " + unit : ""}`;
+  }
+
+  function formatTime(seconds) {
+    if (!isFinite(seconds)) return "∞";
+
+    const year = 31557600;
+
+    if (seconds >= year) {
+      return formatSci(seconds / year, "лет");
+    }
+
+    if (seconds >= 86400) {
+      return (seconds / 86400).toFixed(2) + " сут";
+    }
+
+    if (seconds >= 3600) {
+      return (seconds / 3600).toFixed(2) + " ч";
+    }
+
+    if (seconds >= 1) {
+      return seconds.toFixed(2) + " с";
+    }
+
+    return (seconds * 1000).toFixed(2) + " мс";
+  }
+
+  // ===========================
+  // Случайные величины
+  // ===========================
+  function rand(a, b) {
+    return a + Math.random() * (b - a);
+  }
+
+  function randn() {
+    let u = 0;
+    let v = 0;
+
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+
+  function poisson(lambda) {
+    if (lambda <= 0) return 0;
+
+    if (lambda > 50) {
+      return Math.max(0, Math.round(lambda + Math.sqrt(lambda) * randn()));
+    }
+
+    const limit = Math.exp(-lambda);
+    let k = 0;
+    let p = 1;
+
+    do {
+      k++;
+      p *= Math.random();
+    } while (p > limit);
+
+    return k - 1;
+  }
+
+  // ===========================
+  // Параметры и метки
+  // ===========================
+  function readParams() {
+    currentM = Math.pow(10, Number(ui.massExp.value));
+    currentK = Math.pow(10, Number(ui.energyExp.value));
+    currentBeta = electronBeta(currentK);
+    rsPhys = schwarzschildRadius(currentM);
+    lambdaPhys = deBroglieWavelength(currentK);
+
+    if (!ui.charge.checked) {
+      bhChargeE = 0;
+    }
+  }
+
+  function updateLabels() {
+    $("massVal").textContent = `10^${Number(ui.massExp.value).toFixed(1)} кг`;
+    $("energyVal").textContent = `10^${Number(ui.energyExp.value).toFixed(1)} эВ`;
+    $("fluxVal").textContent = Number(ui.flux.value).toFixed(1);
+    $("beamVal").textContent = Number(ui.beam.value).toFixed(1) + " r_s";
+    $("speedVal").textContent = Number(ui.speed.value).toFixed(1) + "×";
+  }
+
+  function updateInfo() {
+    const M = currentM;
+    const rs = rsPhys;
+    const T = hawkingTemp(M);
+    const P = hawkingPower(M);
+    const tau = hawkingLifetime(M);
+
+    const K = currentK;
+    const beta = currentBeta;
+    const lambda = lambdaPhys;
+
+    const ratio = chargeRatioPerElectron(M);
+    const ratioWave = lambda / rs;
+
+    const waveWarning = ratioWave > 1
+      ? `<span style="color:#ffb44d">λ_e &gt; r_s: классические траектории условны, важна волновая природа</span>`
+      : `<span style="color:#8fff9a">λ_e ≤ r_s: траекторное приближение более уместно</span>`;
+
+    $("info").innerHTML = [
+      `M = ${formatSci(M, "кг")} | r_s = ${formatSci(rs, "м")} | ` +
+      `T_H = ${formatSci(T, "K")} | τ = ${formatTime(tau)} | ` +
+      `P_H = ${formatSci(P, "Вт")}`,
+
+      `E_e = ${formatSci(K, "эВ")} | β = ${beta.toFixed(6)} | ` +
+      `λ_e = ${formatSci(lambda, "м")} | λ/r_s = ${formatSci(ratioWave)} | ${waveWarning}`,
+
+      `Кулон/гравитация для 1e заряда ЧД: ${formatSci(ratio)} | ` +
+      `Q_ЧД = ${bhChargeE} e | ` +
+      `выпущено: ${stats.emitted}, захвачено: ${stats.captured}, ` +
+      `прошло: ${stats.passed}, влево/потеряно: ${stats.left + stats.lost}, ` +
+      `фотонов Хокинга: ${stats.hawking}`
+    ].join("<br>");
+  }
+
+  // ===========================
+  // Звёздное поле и линзирование
+  // ===========================
+  function makeStars() {
+    stars = [];
+
+    for (let i = 0; i < 230; i++) {
+      stars.push({
+        x: Math.random() * CW,
+        y: Math.random() * CH,
+        size: rand(0.3, 1.8),
+        alpha: rand(0.18, 0.85),
+        hue: rand(180, 270)
+      });
+    }
+  }
+
+  function drawStarImage(x, y, size, alpha, hue) {
+    if (x < -20 || x > CW + 20 || y < -20 || y > CH + 20) return;
+
+    ctx.fillStyle = `hsla(${hue}, 85%, 82%, ${alpha})`;
+    ctx.beginPath();
+    ctx.arc(x, y, size, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  function drawStars() {
+    if (!ui.lens.checked) {
+      for (const s of stars) {
+        drawStarImage(s.x, s.y, s.size, s.alpha, s.hue);
+      }
+      return;
+    }
+
+    // Упрощённая точечная линза:
+    // θ_± = (β ± sqrt(β² + 4θ_E²)) / 2
+    const RE = 3.2 * rsPx;
+
+    for (const s of stars) {
+      const dx = s.x - cx;
+      const dy = s.y - cy;
+      const beta = Math.hypot(dx, dy);
+
+      if (beta < 1) continue;
+
+      const root = Math.sqrt(beta * beta + 4 * RE * RE);
+      const thetaPlus = (beta + root) / 2;
+      const thetaMinus = Math.abs(beta - root) / 2;
+
+      const ux = dx / beta;
+      const uy = dy / beta;
+
+      const bright = Math.min(1, RE / (beta + RE) + 0.12);
+
+      // Основное изображение
+      drawStarImage(
+        cx + ux * thetaPlus,
+        cy + uy * thetaPlus,
+        s.size * (0.8 + bright),
+        s.alpha * bright,
+        s.hue
+      );
+
+      // Вторичное изображение, более слабое
+      if (thetaMinus > rsPx * 1.15) {
+        drawStarImage(
+          cx - ux * thetaMinus,
+          cy - uy * thetaMinus,
+          s.size * 0.55,
+          s.alpha * bright * 0.35,
+          s.hue
+        );
+      }
+    }
+  }
+
+  // ===========================
+  // Электроны
+  // ===========================
+  function spawnElectron() {
+    if (electrons.length > 260) return;
+
+    const halfH = CH / (2 * rsPx);
+    const width = Math.min(Number(ui.beam.value), halfH * 0.92);
+    const y = rand(-width, width);
+    const x = -CW / (2 * rsPx) + 2;
+
+    const beta = Math.min(0.998, currentBeta);
+    const vy = rand(-0.01, 0.01) * beta;
+
+    electrons.push({
+      x,
+      y,
+      vx: beta,
+      vy,
+      trail: [],
+      alive: true
+    });
+
+    stats.emitted++;
+  }
+
+  function emitElectrons() {
+    const flux = Number(ui.flux.value);
+    let n = poisson(flux);
+
+    n = Math.min(n, 6);
+
+    for (let i = 0; i < n; i++) {
+      spawnElectron();
+    }
+  }
+
+  function captureElectron(e) {
+    e.alive = false;
+    stats.captured++;
+
+    if (ui.charge.checked) {
+      bhChargeE -= 1; // электрон уносит отрицательный заряд в ЧД
+    }
+
+    addFlash(
+      cx + e.x * rsPx,
+      cy + e.y * rsPx,
+      "rgba(255,150,80,0.9)"
+    );
+  }
+
+  function stepElectron(e, dt) {
+    const r2 = e.x * e.x + e.y * e.y;
+    const r = Math.sqrt(r2);
+
+    if (r <= CAPTURE_R) {
+      captureElectron(e);
+      return false;
+    }
+
+    // Псевдопотенциал Paczynski–Wiita, качественно имитирует усиление поля у горизонта.
+    const denom = Math.max(r - 1.0, 0.05);
+    let aGrav = -0.5 / (denom * denom);
+
+    // Ограничиваем ускорение для устойчивости визуальной интеграции.
+    if (aGrav < -80) aGrav = -80;
+
+    let aCoul = 0;
+
+    if (ui.charge.checked && bhChargeE !== 0) {
+      // alpha > 0 означает отталкивание электрона, если ЧД отрицательно заряжена.
+      const alpha = -bhChargeE * CHARGE_CONST / currentM;
+
+      // Кулоновская часть берётся как ньютоновская 1/r²,
+      // выраженная через отношение к гравитации.
+      aCoul = alpha * 0.5 / Math.max(r2, 0.25);
+
+      if (aCoul > 200) aCoul = 200;
+      if (aCoul < -200) aCoul = -200;
+    }
+
+    const aRad = aGrav + aCoul;
+
+    if (r > 1e-8) {
+      const invR = 1 / r;
+      e.vx += aRad * e.x * invR * dt;
+      e.vy += aRad * e.y * invR * dt;
+    }
+
+    // Ограничение скорости: c = 1 в наших единицах.
+    const sp = Math.hypot(e.vx, e.vy);
+    const maxSp = 0.998;
+
+    if (sp > maxSp) {
+      e.vx *= maxSp / sp;
+      e.vy *= maxSp / sp;
+    }
+
+    e.x += e.vx * dt;
+    e.y += e.vy * dt;
+
+    const xLim = CW / (2 * rsPx) + 3;
+    const yLim = CH / (2 * rsPx) + 3;
+
+    if (e.x > xLim) {
+      e.alive = false;
+      stats.passed++;
+      return false;
+    }
+
+    if (e.x < -xLim) {
+      e.alive = false;
+      stats.left++;
+      return false;
+    }
+
+    if (Math.abs(e.y) > yLim) {
+      e.alive = false;
+      stats.lost++;
+      return false;
+    }
+
+    return true;
+  }
+
+  // ===========================
+  // Излучение Хокинга
+  // ===========================
+  function spawnHawkingPhoton(isChargedEvent = false) {
+    if (hawkingPhotons.length > 140) return;
+
+    const ang = rand(0, Math.PI * 2);
+    const rEmit = rand(1.08, 2.3);
+
+    hawkingPhotons.push({
+      x: rEmit * Math.cos(ang),
+      y: rEmit * Math.sin(ang),
+      angle: ang + rand(-0.25, 0.25),
+      speed: 1,
+      phase: rand(0, 10),
+      eV: hawkingPhotonEnergyEV(currentM),
+      charged: isChargedEvent,
+      alive: true
+    });
+
+    stats.hawking++;
+  }
+
+  function spawnHawkingPhotons() {
+    if (!ui.hawking.checked) return;
+
+    const P = hawkingPower(currentM);
+
+    // Чисто визуальный масштаб частоты событий.
+    const rate = Math.min(10, P / 1e8);
+
+    let n = poisson(rate);
+    n = Math.min(n, 12);
+
+    for (let i = 0; i < n; i++) {
+      spawnHawkingPhoton(false);
+    }
+  }
+
+  function updateDischarge() {
+    if (!ui.charge.checked) {
+      bhChargeE = 0;
+      return;
+    }
+
+    if (!ui.discharge.checked || bhChargeE === 0) return;
+
+    const P = hawkingPower(currentM);
+    const T = hawkingTemp(currentM);
+
+    // Заряженные частицы могут эффективно излучаться, если kT не сильно ниже m_e c^2.
+    const electronRestJ = CONST.me * CONST.c * CONST.c;
+    const thermalJ = CONST.kB * T;
+
+    let prob = Math.min(0.25, P / 1e10);
+
+    if (thermalJ < electronRestJ) {
+      prob *= 1e-6;
+    }
+
+    if (Math.random() < prob) {
+      if (bhChargeE < 0) {
+        bhChargeE += 1; // эмиссия позитрона/ионизационная нейтрализация
+      } else {
+        bhChargeE -= 1;
+      }
+
+      spawnHawkingPhoton(true);
+    }
+  }
+
+  // ===========================
+  // Вспышки
+  // ===========================
+  function addFlash(x, y, color) {
+    if (flashes.length > 100) flashes.shift();
+
+    flashes.push({
+      x,
+      y,
+      r: 3,
+      life: 1,
+      color
+    });
+  }
+
+  // ===========================
+  // Обновление объектов
+  // ===========================
+  function update() {
+    emitElectrons();
+    spawnHawkingPhotons();
+    updateDischarge();
+
+    const simSpeed = Number(ui.speed.value);
+    const steps = Math.max(1, Math.round(12 * simSpeed));
+    const dt = 0.02;
+    const dtFrame = steps * dt;
+
+    // Электроны
+    for (const e of electrons) {
+      if (!e.alive) continue;
+
+      for (let s = 0; s < steps; s++) {
+        if (!stepElectron(e, dt)) break;
+      }
+
+      if (e.alive) {
+        e.trail.push({ x: e.x, y: e.y });
+        if (e.trail.length > 90) e.trail.shift();
+      }
+    }
+
+    electrons = electrons.filter(e => e.alive);
+
+    // Фотоны Хокинга
+    for (const p of hawkingPhotons) {
+      p.x += Math.cos(p.angle) * p.speed * dtFrame;
+      p.y += Math.sin(p.angle) * p.speed * dtFrame;
+      p.phase += 0.6;
+
+      const xLim = CW / (2 * rsPx) + 6;
+      const yLim = CH / (2 * rsPx) + 6;
+
+      if (p.x < -xLim || p.x > xLim || p.y < -yLim || p.y > yLim) {
+        p.alive = false;
+      }
+    }
+
+    hawkingPhotons = hawkingPhotons.filter(p => p.alive);
+
+    // Вспышки
+    for (const f of flashes) {
+      f.r += 1.6;
+      f.life -= 0.045;
+    }
+
+    flashes = flashes.filter(f => f.life > 0);
+  }
+
+  // ===========================
+  // Отрисовка
+  // ===========================
+  function drawBlackHole() {
+    const T = hawkingTemp(currentM);
+
+    let glowHue = 280;
+
+    if (T < 1e3) glowHue = 35;
+    else if (T < 1e6) glowHue = 200;
+    else if (T < 1e9) glowHue = 250;
+    else glowHue = 285;
+
+    // Внешнее свечение
+    ctx.save();
+    ctx.shadowColor = `hsla(${glowHue}, 100%, 70%, 0.75)`;
+    ctx.shadowBlur = 32;
+
+    // Горизонт
+    ctx.fillStyle = "#000";
+    ctx.beginPath();
+    ctx.arc(cx, cy, rsPx, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // Фотонная сфера
+    ctx.setLineDash([5, 5]);
+    ctx.strokeStyle = "rgba(255,220,120,0.55)";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(cx, cy, PHOTON_SPHERE_R * rsPx, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // ISCO
+    ctx.strokeStyle = "rgba(130,180,255,0.28)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.arc(cx, cy, ISCO_R * rsPx, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.setLineDash([]);
+
+    // Электрическая аура, если ЧД заряжена
+    if (ui.charge.checked && bhChargeE !== 0) {
+      const q = bhChargeE;
+      const col = q < 0 ? "255,80,130" : "120,180,255";
+      const alpha = Math.min(0.75, Math.abs(q) * 0.07 + 0.12);
+
+      ctx.strokeStyle = `rgba(${col}, ${alpha})`;
+      ctx.lineWidth = 2.2;
+      ctx.beginPath();
+      ctx.arc(cx, cy, rsPx + 4.5, 0, Math.PI * 2);
+      ctx.stroke();
+
+      ctx.fillStyle = `rgba(${col}, ${Math.min(0.9, alpha + 0.15)})`;
+      ctx.font = "12px system-ui";
+      ctx.fillText(`Q = ${q} e`, cx + rsPx + 10, cy - rsPx - 8);
+    }
+
+    // Подписи радиусов
+    ctx.fillStyle = "rgba(220,230,255,0.6)";
+    ctx.font = "11px system-ui";
+
+    ctx.fillText("горизонт", cx + rsPx + 6, cy + 4);
+    ctx.fillText("фотонная сфера", cx + PHOTON_SPHERE_R * rsPx + 6, cy - 10);
+    ctx.fillText("ISCO", cx + ISCO_R * rsPx + 6, cy + 18);
+  }
+
+  function drawElectrons() {
+    for (const e of electrons) {
+      // След
+      if (e.trail.length > 1) {
+        ctx.beginPath();
+
+        for (let i = 0; i < e.trail.length; i++) {
+          const px = cx + e.trail[i].x * rsPx;
+          const py = cy + e.trail[i].y * rsPx;
+
+          if (i === 0) ctx.moveTo(px, py);
+          else ctx.lineTo(px, py);
+        }
+
+        ctx.strokeStyle = "rgba(80,240,255,0.28)";
+        ctx.lineWidth = 1.3;
+        ctx.stroke();
+      }
+
+      // Сам электрон
+      const px = cx + e.x * rsPx;
+      const py = cy + e.y * rsPx;
+
+      ctx.save();
+      ctx.shadowColor = "#49f0ff";
+      ctx.shadowBlur = 10;
+
+      ctx.fillStyle = "#9df6ff";
+      ctx.beginPath();
+      ctx.arc(px, py, 3.2, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = "#052a33";
+      ctx.beginPath();
+      ctx.arc(px, py, 1.3, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.restore();
+    }
+  }
+
+  function hawkingColor(p) {
+    if (p.charged) {
+      return "rgba(255,175,95,0.95)";
+    }
+
+    const eV = Math.max(1, p.eV);
+    const t = Math.min(1, Math.log10(eV) / 9);
+    const hue = 20 + 260 * t;
+
+    return `hsla(${hue}, 100%, 72%, 0.95)`;
+  }
+
+  function drawHawkingPhotons() {
+    ctx.save();
+    ctx.lineCap = "round";
+
+    for (const p of hawkingPhotons) {
+      const px = cx + p.x * rsPx;
+      const py = cy + p.y * rsPx;
+
+      const color = hawkingColor(p);
+      const perp = p.angle + Math.PI / 2;
+      const amp = 2.2;
+      const tail = 14;
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.8;
+
+      ctx.beginPath();
+
+      for (let k = 0; k < tail; k++) {
+        const bx = px - Math.cos(p.angle) * k * 2.0;
+        const by = py - Math.sin(p.angle) * k * 2.0;
+        const off = Math.sin(p.phase - k * 0.55) * amp * (1 - k / tail);
+
+        const xx = bx + Math.cos(perp) * off;
+        const yy = by + Math.sin(perp) * off;
+
+        if (k === 0) ctx.moveTo(xx, yy);
+        else ctx.lineTo(xx, yy);
+      }
+
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  }
+
+  function drawFlashes() {
+    ctx.save();
+
+    for (const f of flashes) {
+      ctx.globalAlpha = Math.max(0, f.life);
+      ctx.strokeStyle = f.color;
+      ctx.lineWidth = 2;
+
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, f.r, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+    ctx.globalAlpha = 1;
+  }
+
+  function drawHUD() {
+    // Масштаб
+    const metersPerPixel = rsPhys / rsPx;
+
+    ctx.fillStyle = "rgba(220,230,255,0.78)";
+    ctx.font = "12px system-ui";
+
+    ctx.fillText(
+      `1 px = ${formatSci(metersPerPixel, "м")} | r_s = ${formatSci(rsPhys, "м")}`,
+      CW - 430,
+      CH - 16
+    );
+
+    ctx.fillText("Пучок электронов →", 16, CH - 16);
+
+    // Легенда
+    ctx.fillStyle = "rgba(200,215,255,0.68)";
+    ctx.fillText(
+      "Голубые точки — электроны; жёлтая пунктирная окружность — фотонная сфера; синяя — ISCO; волнистые линии — излучение Хокинга",
+      16,
+      24
+    );
+  }
+
+  function draw() {
+    ctx.fillStyle = "#02030a";
+    ctx.fillRect(0, 0, CW, CH);
+
+    drawStars();
+    drawBlackHole();
+    drawHawkingPhotons();
+    drawElectrons();
+    drawFlashes();
+    drawHUD();
+  }
+
+  // ===========================
+  // Сброс
+  // ===========================
+  function fullReset() {
+    electrons = [];
+    hawkingPhotons = [];
+    flashes = [];
+
+    stats = {
+      emitted: 0,
+      captured: 0,
+      passed: 0,
+      left: 0,
+      lost: 0,
+      hawking: 0
+    };
+
+    bhChargeE = 0;
+
+    makeStars();
+    readParams();
+    updateLabels();
+    updateInfo();
+  }
+
+  // ===========================
+  // Главный цикл
+  // ===========================
+  function tick() {
+    frame++;
+
+    readParams();
+
+    if (!ui.pause.checked) {
+      update();
+    }
+
+    draw();
+
+    if (frame % 8 === 0) {
+      updateInfo();
+    }
+
+    requestAnimationFrame(tick);
+  }
+
+  // ===========================
+  // Обработчики
+  // ===========================
+  ui.restart.addEventListener("click", fullReset);
+
+  const sliders = [
+    ui.massExp,
+    ui.energyExp,
+    ui.flux,
+    ui.beam,
+    ui.speed
+  ];
+
+  for (const s of sliders) {
+    s.addEventListener("input", () => {
+      readParams();
+      updateLabels();
+    });
+  }
+
+  // ===========================
+  // Запуск
+  // ===========================
+  makeStars();
+  readParams();
+  updateLabels();
+  updateInfo();
+  tick();
+})();
+</script>
+
+</body>
+</html>

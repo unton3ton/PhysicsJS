@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>TDSE: две частицы в 1D</title>
+<style>
+  body {
+    background: #111;
+    color: #eee;
+    font-family: system-ui, sans-serif;
+    margin: 16px;
+  }
+  canvas {
+    border: 1px solid #333;
+    display: block;
+    margin: 8px 0;
+    background: #000;
+  }
+  .controls {
+    display: flex;
+    gap: 14px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+  #heat {
+    width: 512px;
+    height: 512px;
+    image-rendering: pixelated;
+  }
+  button, select, input {
+    font-size: 14px;
+  }
+</style>
+</head>
+<body>
+
+<h2>Двухчастичное одномерное TDSE: |Ψ(x₁,x₂)|²</h2>
+
+<div class="controls">
+  <label>
+    Система:
+    <select id="mode">
+      <option value="ee">электрон–электрон</option>
+      <option value="ep">электрон–протон</option>
+    </select>
+  </label>
+
+  <label id="symLabel">
+    Симметрия e-e:
+    <select id="sym">
+      <option value="0">различимые</option>
+      <option value="1">синглет: симметричная</option>
+      <option value="-1">триплет: антисимметричная</option>
+    </select>
+  </label>
+
+  <label>
+    Шагов/кадр:
+    <input id="steps" type="range" min="1" max="50" value="10">
+    <span id="stepsVal">10</span>
+  </label>
+
+  <label>
+    <input id="absorber" type="checkbox" checked>
+    поглотитель границ
+  </label>
+
+  <button id="toggle">Пауза</button>
+  <button id="reset">Сброс</button>
+</div>
+
+<canvas id="heat" width="128" height="128"></canvas>
+<canvas id="plot" width="512" height="160"></canvas>
+<div id="info"></div>
+
+<script>
+"use strict";
+
+const modeEl = document.getElementById("mode");
+const symEl = document.getElementById("sym");
+const stepsEl = document.getElementById("steps");
+const stepsVal = document.getElementById("stepsVal");
+const toggleBtn = document.getElementById("toggle");
+const resetBtn = document.getElementById("reset");
+const absorberEl = document.getElementById("absorber");
+
+const heat = document.getElementById("heat");
+const plot = document.getElementById("plot");
+const info = document.getElementById("info");
+
+// --------------------------------------------------
+// Параметры сетки
+// N должна быть степенью двойки для FFT
+// --------------------------------------------------
+const N = 128;
+const L = 80;                 // размер области в боровских радиусах
+const dx = L / N;
+const NN = N * N;
+
+heat.width = N;
+heat.height = N;
+
+const hctx = heat.getContext("2d");
+const img = hctx.createImageData(N, N);
+const pctx = plot.getContext("2d");
+
+// Координаты
+const xs = new Float64Array(N);
+for (let i = 0; i < N; i++) {
+  xs[i] = -L / 2 + i * dx;
+}
+
+// Волновые числа для спектрального кинетического оператора
+const kFreq = new Float64Array(N);
+for (let p = 0; p < N; p++) {
+  const f = (p < N / 2) ? p : p - N;
+  kFreq[p] = 2 * Math.PI * f / L;
+}
+
+// Массивы волновой функции и вспомогательные массивы
+const re = new Float64Array(NN);
+const im = new Float64Array(NN);
+
+const dens = new Float64Array(NN);
+
+const V = new Float64Array(NN);
+const potRe = new Float64Array(NN);
+const potIm = new Float64Array(NN);
+const kinRe = new Float64Array(NN);
+const kinIm = new Float64Array(NN);
+const mask = new Float64Array(NN);
+
+const n1 = new Float64Array(N);
+const n2 = new Float64Array(N);
+
+const tmpRe = new Float64Array(N);
+const tmpIm = new Float64Array(N);
+
+// Состояние
+let dt = 0.02;
+let time = 0;
+let running = true;
+let stepsPerFrame = +stepsEl.value;
+let useAbsorber = absorberEl.checked;
+
+// Массы и произведение зарядов в атомных единицах
+let m1 = 1;
+let m2 = 1;
+let qprod = 1;
+
+// Параметр смягчения кулоновского потенциала
+const aSoft = 1.0;
+
+// --------------------------------------------------
+// Инициализация потенциалов и фаз
+// --------------------------------------------------
+
+function buildPotential() {
+  const halfL = L / 2;
+
+  for (let i = 0; i < N; i++) {
+    const xi = xs[i];
+    const row = i * N;
+
+    for (let j = 0; j < N; j++) {
+      let r = xi - xs[j];
+
+      // минимальный образ для периодической согласованности
+      if (r > halfL) r -= L;
+      if (r < -halfL) r += L;
+
+      V[row + j] = qprod / Math.sqrt(r * r + aSoft * aSoft);
+    }
+  }
+}
+
+function buildPhases() {
+  // Потенциал: exp(-i V dt / 2)
+  for (let idx = 0; idx < NN; idx++) {
+    const ph = -0.5 * dt * V[idx];
+    potRe[idx] = Math.cos(ph);
+    potIm[idx] = Math.sin(ph);
+  }
+
+  // Кинетическая часть: exp(-i T dt)
+  for (let i = 0; i < N; i++) {
+    const t1 = kFreq[i] * kFreq[i] / (2 * m1);
+    const row = i * N;
+
+    for (let j = 0; j < N; j++) {
+      const T = t1 + kFreq[j] * kFreq[j] / (2 * m2);
+      const ph = -dt * T;
+      const idx = row + j;
+
+      kinRe[idx] = Math.cos(ph);
+      kinIm[idx] = Math.sin(ph);
+    }
+  }
+}
+
+function buildMask() {
+  const edge = 12;
+  const strength = 0.7;
+  const halfL = L / 2;
+
+  const W = new Float64Array(N);
+
+  for (let i = 0; i < N; i++) {
+    const d = Math.abs(xs[i]) - (halfL - edge);
+
+    if (useAbsorber && d > 0) {
+      const f = d / edge;
+      W[i] = strength * f * f * f;
+    }
+  }
+
+  for (let i = 0; i < N; i++) {
+    const row = i * N;
+    const Wi = W[i];
+
+    for (let j = 0; j < N; j++) {
+      mask[row + j] = Math.exp(-dt * (Wi + W[j]));
+    }
+  }
+}
+
+// --------------------------------------------------
+// Начальное состояние
+// --------------------------------------------------
+
+function makeGaussian(x0, sigma, kk) {
+  const pr = new Float64Array(N);
+  const pi = new Float64Array(N);
+
+  for (let i = 0; i < N; i++) {
+    const x = xs[i];
+    const amp = Math.exp(-((x - x0) * (x - x0)) / (4 * sigma * sigma));
+
+    pr[i] = amp * Math.cos(kk * x);
+    pi[i] = amp * Math.sin(kk * x);
+  }
+
+  return { re: pr, im: pi };
+}
+
+function normalize() {
+  let s = 0;
+
+  for (let idx = 0; idx < NN; idx++) {
+    s += re[idx] * re[idx] + im[idx] * im[idx];
+  }
+
+  s *= dx * dx;
+
+  if (s > 0) {
+    const f = 1 / Math.sqrt(s);
+
+    for (let idx = 0; idx < NN; idx++) {
+      re[idx] *= f;
+      im[idx] *= f;
+    }
+  }
+}
+
+function buildInitialWavefunction(mode, sym) {
+  let A, B;
+
+  if (mode === "ee") {
+    // Два электронных волновых пакета, летящих навстречу друг другу
+    A = makeGaussian(-18, 2.5, +1.0);
+    B = makeGaussian(+18, 2.5, -1.0);
+  } else {
+    // Электрон летит к протону; полный импульс примерно ноль
+    A = makeGaussian(-22, 2.5, +1.0); // электрон
+    B = makeGaussian(0,   2.0, -1.0); // протон
+  }
+
+  for (let i = 0; i < N; i++) {
+    const Ar = A.re[i];
+    const Ai = A.im[i];
+
+    const BrI = B.re[i];
+    const BiI = B.im[i];
+
+    const row = i * N;
+
+    for (let j = 0; j < N; j++) {
+      const Brj = B.re[j];
+      const Bij = B.im[j];
+
+      // A(x1) B(x2)
+      let rr = Ar * Brj - Ai * Bij;
+      let ii = Ar * Bij + Ai * Brj;
+
+      // Для одинаковых электронов можно симметризовать/антисимметризовать:
+      // ψ(x1,x2) = A(x1)B(x2) ± B(x1)A(x2)
+      if (sym !== 0) {
+        const Arj = A.re[j];
+        const Aij = A.im[j];
+
+        const sr = BrI * Arj - BiI * Aij;
+        const si = BrI * Aij + BiI * Arj;
+
+        rr += sym * sr;
+        ii += sym * si;
+      }
+
+      re[row + j] = rr;
+      im[row + j] = ii;
+    }
+  }
+}
+
+function initState() {
+  const mode = modeEl.value;
+  const sym = (mode === "ee") ? parseInt(symEl.value, 10) : 0;
+
+  if (mode === "ee") {
+    m1 = 1;
+    m2 = 1;
+    qprod = +1; // электрон-электрон: отталкивание
+  } else {
+    m1 = 1;
+    m2 = 1836.15267343; // масса протона в массах электрона
+    qprod = -1;         // электрон-протон: притяжение
+  }
+
+  buildPotential();
+  buildPhases();
+  buildMask();
+  buildInitialWavefunction(mode, sym);
+  normalize();
+
+  time = 0;
+}
+
+// --------------------------------------------------
+// FFT
+// --------------------------------------------------
+
+function fft1D(aRe, aIm, invert) {
+  const n = aRe.length;
+
+  // bit-reversal
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+
+    for (; j & bit; bit >>= 1) {
+      j ^= bit;
+    }
+
+    j ^= bit;
+
+    if (i < j) {
+      let tr = aRe[i];
+      aRe[i] = aRe[j];
+      aRe[j] = tr;
+
+      let ti = aIm[i];
+      aIm[i] = aIm[j];
+      aIm[j] = ti;
+    }
+  }
+
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = 2 * Math.PI / len * (invert ? 1 : -1);
+    const wlenRe = Math.cos(ang);
+    const wlenIm = Math.sin(ang);
+    const half = len >> 1;
+
+    for (let i = 0; i < n; i += len) {
+      let wre = 1;
+      let wim = 0;
+
+      for (let j = 0; j < half; j++) {
+        const uRe = aRe[i + j];
+        const uIm = aIm[i + j];
+
+        const vRe = aRe[i + j + half] * wre - aIm[i + j + half] * wim;
+        const vIm = aRe[i + j + half] * wim + aIm[i + j + half] * wre;
+
+        aRe[i + j] = uRe + vRe;
+        aIm[i + j] = uIm + vIm;
+
+        aRe[i + j + half] = uRe - vRe;
+        aIm[i + j + half] = uIm - vIm;
+
+        const nextWre = wre * wlenRe - wim * wlenIm;
+        const nextWim = wre * wlenIm + wim * wlenRe;
+
+        wre = nextWre;
+        wim = nextWim;
+      }
+    }
+  }
+
+  if (invert) {
+    const s = 1 / n;
+
+    for (let i = 0; i < n; i++) {
+      aRe[i] *= s;
+      aIm[i] *= s;
+    }
+  }
+}
+
+function fft2D(arrRe, arrIm, inverse) {
+  // строки
+  for (let i = 0; i < N; i++) {
+    const off = i * N;
+
+    for (let j = 0; j < N; j++) {
+      tmpRe[j] = arrRe[off + j];
+      tmpIm[j] = arrIm[off + j];
+    }
+
+    fft1D(tmpRe, tmpIm, inverse);
+
+    for (let j = 0; j < N; j++) {
+      arrRe[off + j] = tmpRe[j];
+      arrIm[off + j] = tmpIm[j];
+    }
+  }
+
+  // столбцы
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      tmpRe[i] = arrRe[i * N + j];
+      tmpIm[i] = arrIm[i * N + j];
+    }
+
+    fft1D(tmpRe, tmpIm, inverse);
+
+    for (let i = 0; i < N; i++) {
+      arrRe[i * N + j] = tmpRe[i];
+      arrIm[i * N + j] = tmpIm[i];
+    }
+  }
+}
+
+// --------------------------------------------------
+// Шаг по времени
+// --------------------------------------------------
+
+function applyFactor(fr, fi) {
+  for (let idx = 0; idx < NN; idx++) {
+    const r = re[idx];
+    const ii = im[idx];
+
+    re[idx] = r * fr[idx] - ii * fi[idx];
+    im[idx] = r * fi[idx] + ii * fr[idx];
+  }
+}
+
+function step() {
+  // половина потенциала
+  applyFactor(potRe, potIm);
+
+  // кинетическая часть в импульсном пространстве
+  fft2D(re, im, false);
+  applyFactor(kinRe, kinIm);
+  fft2D(re, im, true);
+
+  // вторая половина потенциала
+  applyFactor(potRe, potIm);
+
+  // поглотитель границ
+  if (useAbsorber) {
+    for (let idx = 0; idx < NN; idx++) {
+      re[idx] *= mask[idx];
+      im[idx] *= mask[idx];
+    }
+  }
+}
+
+// --------------------------------------------------
+// Визуализация
+// --------------------------------------------------
+
+function drawPlot() {
+  const w = plot.width;
+  const h = plot.height;
+
+  pctx.fillStyle = "#000";
+  pctx.fillRect(0, 0, w, h);
+
+  let maxN = 0;
+
+  for (let i = 0; i < N; i++) {
+    if (n1[i] > maxN) maxN = n1[i];
+    if (n2[i] > maxN) maxN = n2[i];
+  }
+
+  if (maxN <= 0) return;
+
+  const drawArr = (arr, color) => {
+    pctx.strokeStyle = color;
+    pctx.lineWidth = 1.5;
+    pctx.beginPath();
+
+    for (let i = 0; i < N; i++) {
+      const x = i / (N - 1) * w;
+      const y = h - 5 - (arr[i] / maxN) * (h - 20);
+
+      if (i === 0) pctx.moveTo(x, y);
+      else pctx.lineTo(x, y);
+    }
+
+    pctx.stroke();
+  };
+
+  drawArr(n1, "#00e5ff");
+  drawArr(n2, "#ff9f43");
+
+  pctx.fillStyle = "#00e5ff";
+  pctx.fillText("частица 1 / электрон", 10, 14);
+
+  pctx.fillStyle = "#ff9f43";
+  pctx.fillText(
+    modeEl.value === "ep" ? "частица 2 / протон" : "частица 2 / электрон",
+    220,
+    14
+  );
+}
+
+function render() {
+  let maxD = 0;
+  let sumD = 0;
+  let sx1 = 0;
+  let sx2 = 0;
+
+  n1.fill(0);
+  n2.fill(0);
+
+  for (let i = 0; i < N; i++) {
+    const x1 = xs[i];
+    const row = i * N;
+
+    for (let j = 0; j < N; j++) {
+      const idx = row + j;
+
+      const r = re[idx];
+      const ii = im[idx];
+      const d = r * r + ii * ii;
+
+      dens[idx] = d;
+
+      sumD += d;
+      sx1 += d * x1;
+      sx2 += d * xs[j];
+
+      n1[i] += d;
+      n2[j] += d;
+
+      if (d > maxD) maxD = d;
+    }
+  }
+
+  const norm = sumD * dx * dx;
+
+  let ex1 = 0;
+  let ex2 = 0;
+
+  if (sumD > 0) {
+    ex1 = sx1 / sumD;
+    ex2 = sx2 / sumD;
+  }
+
+  const data = img.data;
+  const scale = maxD > 0 ? 1 / maxD : 1;
+
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      const idx = i * N + j;
+
+      let t = dens[idx] * scale;
+      t = Math.pow(t, 0.45);
+
+      if (t > 1) t = 1;
+
+      // простая "hot" палитра: чёрный -> красный -> жёлтый -> белый
+      const rr = Math.floor(255 * Math.min(1, t * 2));
+      const gg = Math.floor(255 * Math.min(1, Math.max(0, t * 2 - 0.5)));
+      const bb = Math.floor(255 * Math.min(1, Math.max(0, t * 2 - 1.0)));
+
+      // горизонталь: x1, вертикаль: x2, вверх — рост x2
+      const p = ((N - 1 - j) * N + i) * 4;
+
+      data[p + 0] = rr;
+      data[p + 1] = gg;
+      data[p + 2] = bb;
+      data[p + 3] = 255;
+    }
+  }
+
+  hctx.putImageData(img, 0, 0);
+
+  drawPlot();
+
+  const lab2 = modeEl.value === "ep" ? "⟨x_p⟩" : "⟨x₂⟩";
+
+  info.textContent =
+    `t = ${time.toFixed(2)} a.u. | ` +
+    `норма = ${norm.toFixed(3)} | ` +
+    `⟨x₁⟩ = ${ex1.toFixed(2)} | ` +
+    `${lab2} = ${ex2.toFixed(2)}`;
+}
+
+// --------------------------------------------------
+// Цикл анимации
+// --------------------------------------------------
+
+function frame() {
+  if (running) {
+    for (let s = 0; s < stepsPerFrame; s++) {
+      step();
+      time += dt;
+    }
+  }
+
+  render();
+  requestAnimationFrame(frame);
+}
+
+// --------------------------------------------------
+// Управление
+// --------------------------------------------------
+
+function updateSymEnabled() {
+  symEl.disabled = modeEl.value !== "ee";
+}
+
+modeEl.addEventListener("change", () => {
+  updateSymEnabled();
+  initState();
+});
+
+symEl.addEventListener("change", () => {
+  initState();
+});
+
+stepsEl.addEventListener("input", () => {
+  stepsPerFrame = +stepsEl.value;
+  stepsVal.textContent = stepsEl.value;
+});
+
+toggleBtn.addEventListener("click", () => {
+  running = !running;
+  toggleBtn.textContent = running ? "Пауза" : "Старт";
+});
+
+resetBtn.addEventListener("click", () => {
+  initState();
+});
+
+absorberEl.addEventListener("change", () => {
+  useAbsorber = absorberEl.checked;
+  initState();
+});
+
+updateSymEnabled();
+stepsVal.textContent = stepsEl.value;
+initState();
+requestAnimationFrame(frame);
+
+</script>
+</body>
+</html>

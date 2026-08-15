@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Поток и туннелирование в чёрной дыре</title>
+<style>
+ body{background:#111;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#000;border:1px solid #333;display:block;margin:8px 0;}
+ .controls{display:flex;gap:14px;flex-wrap:wrap;align-items:center;}
+ select,input,button{font-size:14px;}
+</style>
+</head>
+<body>
+<h2>Поток на чёрную дыру: отражение и туннелирование</h2>
+<div class="controls">
+ <label>режим:
+  <select id="mode">
+   <option value="flux">поток</option>
+   <option value="pulse">импульс</option>
+  </select>
+ </label>
+ <label>k₀: <input id="k0" type="range" min="0.2" max="1.2" step="0.01" value="0.5"> <span id="k0Val">0.50</span></label>
+ <label>амплитуда: <input id="amp" type="range" min="0.05" max="0.6" step="0.01" value="0.25"> <span id="ampVal">0.25</span></label>
+ <label>шагов/кадр: <input id="steps" type="range" min="1" max="60" value="20"> <span id="stepsVal">20</span></label>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+<canvas id="wave" width="900" height="300"></canvas>
+<canvas id="phys" width="900" height="140"></canvas>
+<div id="info"></div>
+<script>
+"use strict";
+const wave=document.getElementById('wave'), wctx=wave.getContext('2d');
+const phys=document.getElementById('phys'), pctx=phys.getContext('2d');
+const info=document.getElementById('info');
+const modeEl=document.getElementById('mode');
+const k0El=document.getElementById('k0'), k0Val=document.getElementById('k0Val');
+const ampEl=document.getElementById('amp'), ampVal=document.getElementById('ampVal');
+const stepsEl=document.getElementById('steps'), stepsVal=document.getElementById('stepsVal');
+const pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+const N=1024;
+const RSMIN=-14, RSMAX=70;
+const dx=(RSMAX-RSMIN)/(N-1);
+const dt=0.45*dx;
+
+let mode='flux';
+let k0=+k0El.value;
+let srcAmp=+ampEl.value;
+let stepsPerFrame=+stepsEl.value;
+let running=true, time=0;
+let srcEnv=0;
+const srcX=55;
+
+const phi=new Float64Array(N), pi=new Float64Array(N);
+const V=new Float64Array(N), rOfX=new Float64Array(N);
+const sL=new Float64Array(N), sR=new Float64Array(N);
+const flux=new Float64Array(N);
+
+let E0=1, fallen=0, escaped=0;
+let iPeak=0, Vmax=0, iMonR=0, iMonL=0;
+let incS=0, refS=0, transS=0, fMaxEMA=1e-6;
+
+let particles=[], spawnAccum=0, pFallen=0, pEscaped=0;
+
+function rFromTortoise(rs){
+ let r=rs>3?rs-Math.log(rs):1+Math.exp(rs-1);
+ for(let it=0;it<60;it++){
+  if(r<=1+1e-6)r=1+1e-6;
+  const f=r+Math.log(r-1)-rs, fp=1+1/(r-1);
+  const dr=f/fp; r-=dr;
+  if(Math.abs(dr)<1e-10)break;
+ }
+ return Math.max(r,1+1e-6);
+}
+
+function build(){
+ Vmax=0;
+ for(let i=0;i<N;i++){
+  const rs=RSMIN+i*dx, r=rFromTortoise(rs);
+  rOfX[i]=r;
+  V[i]=(1-1/r)*(2/(r*r)+1/(r*r*r));
+  if(V[i]>Vmax){Vmax=V[i]; iPeak=i;}
+ }
+ const w=60;
+ for(let i=0;i<N;i++){
+  const l=i<w?(w-i)/w:0, rr=i>N-1-w?(i-(N-1-w))/w:0;
+  sL[i]=3*l*l; sR[i]=3*rr*rr;
+ }
+ iMonR=Math.round((30-RSMIN)/dx);
+ iMonL=Math.round((-6-RSMIN)/dx);
+}
+
+function init(){
+ build();
+ time=0; fallen=0; escaped=0; srcEnv=0;
+ incS=refS=transS=0; fMaxEMA=1e-6;
+ particles=[]; spawnAccum=0; pFallen=0; pEscaped=0;
+ phi.fill(0); pi.fill(0);
+ if(mode==='pulse'){
+  const x0=45, sigma=3.0;
+  for(let i=0;i<N;i++){
+   const x=RSMIN+i*dx;
+   const g=Math.exp(-((x-x0)*(x-x0))/(4*sigma*sigma));
+   phi[i]=g*Math.cos(k0*(x-x0));
+   const dg=-(x-x0)/(2*sigma*sigma)*g;
+   pi[i]=dg*Math.cos(k0*(x-x0))-g*k0*Math.sin(k0*(x-x0));
+  }
+  for(let n=0;n<250;n++){
+   particles.push({x:45+(Math.random()*2-1)*6, dir:-1, decided:false});
+  }
+ }
+}
+
+function addSource(){
+ if(mode!=='flux')return;
+ const iSrc=Math.round((srcX-RSMIN)/dx);
+ const s=srcAmp*srcEnv*Math.sin(k0*time);
+ for(let m=-6;m<=6;m++){
+  const i=iSrc+m; if(i<1||i>=N-1)continue;
+  pi[i]+=dt*s*Math.exp(-m*m/18);
+ }
+}
+
+function step(){
+ addSource();
+ for(let i=1;i<N-1;i++){
+  const d2=(phi[i+1]-2*phi[i]+phi[i-1])/(dx*dx);
+  pi[i]+=dt*(d2-V[i]*phi[i]);
+  pi[i]-=dt*(sL[i]+sR[i])*pi[i];
+  fallen+=dt*sL[i]*pi[i]*pi[i]*dx;
+  escaped+=dt*sR[i]*pi[i]*pi[i]*dx;
+ }
+ for(let i=1;i<N-1;i++) phi[i]+=dt*pi[i];
+ phi[0]=phi[N-1]=0; pi[0]=pi[N-1]=0;
+ time+=dt;
+ srcEnv=Math.min(1,time/25);
+}
+
+function computeFlux(){
+ let mx=1e-9;
+ for(let i=1;i<N-1;i++){
+  const phx=(phi[i+1]-phi[i-1])/(2*dx);
+  flux[i]=-pi[i]*phx;
+  const a=Math.abs(flux[i]); if(a>mx)mx=a;
+ }
+ fMaxEMA=Math.max(fMaxEMA*0.995,mx);
+
+ // разложение на встречные волны в контрольных точках
+ const phxR=(phi[iMonR+1]-phi[iMonR-1])/(2*dx);
+ const aL=(pi[iMonR]+phxR)/2, aR=(pi[iMonR]-phxR)/2;
+ incS=incS*0.98+aL*aL*0.02;
+ refS=refS*0.98+aR*aR*0.02;
+ const phxL=(phi[iMonL+1]-phi[iMonL-1])/(2*dx);
+ const aLt=(pi[iMonL]+phxL)/2;
+ transS=transS*0.98+aLt*aLt*0.02;
+}
+
+function updateParticles(dtFrame){
+ const xPeak=RSMIN+iPeak*dx;
+ if(mode==='flux'){
+  spawnAccum+=dtFrame*18*srcEnv;
+  while(spawnAccum>1 && particles.length<700){
+   spawnAccum-=1;
+   particles.push({x:srcX+Math.random()*3, dir:-1, decided:false});
+  }
+ }
+ const Rinst=incS>1e-7?Math.min(1,refS/incS):0.5;
+ for(let k=particles.length-1;k>=0;k--){
+  const p=particles[k], prev=p.x;
+  p.x+=p.dir*dtFrame;
+  if(!p.decided && p.dir<0 && prev>=xPeak && p.x<xPeak){
+   p.decided=true;
+   if(Math.random()<Rinst) p.dir=+1;
+  }
+  if(p.x<RSMIN+0.5){particles.splice(k,1); pFallen++;}
+  else if(p.x>RSMAX-0.5){particles.splice(k,1); pEscaped++;}
+ }
+}
+
+function draw(){
+ const W=wave.width,H=wave.height;
+ const base=H*0.42, lane=H*0.62, fbase=H*0.86;
+ wctx.fillStyle='#000'; wctx.fillRect(0,0,W,H);
+
+ // горизонт
+ let g=wctx.createLinearGradient(0,0,70,0);
+ g.addColorStop(0,'rgba(255,60,60,0.4)'); g.addColorStop(1,'rgba(255,60,60,0)');
+ wctx.fillStyle=g; wctx.fillRect(0,0,70,H);
+ wctx.fillStyle='#f66'; wctx.fillText('горизонт',8,14);
+ wctx.fillStyle='#888'; wctx.fillText('r* → +∞',W-70,14);
+
+ // барьер
+ wctx.strokeStyle='#ffd43b'; wctx.beginPath();
+ for(let i=0;i<N;i+=2){
+  const x=i/(N-1)*W, y=base-V[i]*220;
+  i?wctx.lineTo(x,y):wctx.moveTo(x,y);
+ }
+ wctx.stroke();
+
+ // поле
+ wctx.strokeStyle='#00e5ff'; wctx.beginPath();
+ for(let i=0;i<N;i++){
+  const x=i/(N-1)*W, y=base-phi[i]*120;
+  i?wctx.lineTo(x,y):wctx.moveTo(x,y);
+ }
+ wctx.stroke();
+
+ // поток энергии
+ const fScale=35/(fMaxEMA+1e-9);
+ for(let i=0;i<N;i+=3){
+  const f=flux[i]; if(Math.abs(f)<fMaxEMA*0.02)continue;
+  const x=i/(N-1)*W;
+  const len=Math.min(35,Math.abs(f)*fScale);
+  wctx.strokeStyle=f<0?'rgba(255,80,80,0.7)':'rgba(80,255,120,0.7)';
+  wctx.beginPath(); wctx.moveTo(x,fbase); wctx.lineTo(x,fbase-Math.sign(f)*len); wctx.stroke();
+ }
+ wctx.fillStyle='#888'; wctx.fillText('поток энергии: красный — в дыру, зелёный — наружу',8,fbase+12);
+
+ // частицы потока
+ for(const p of particles){
+  const x=(p.x-RSMIN)/(RSMAX-RSMIN)*W;
+  wctx.fillStyle=p.dir<0?'#ffd43b':'#7cff7c';
+  wctx.beginPath(); wctx.arc(x,lane,2,0,Math.PI*2); wctx.fill();
+ }
+
+ // источник
+ if(mode==='flux'){
+  const x=(srcX-RSMIN)/(RSMAX-RSMIN)*W;
+  wctx.fillStyle='#c9a7ff'; wctx.fillRect(x-2,lane-14,4,28);
+  wctx.fillText('источник',x-24,lane-20);
+ }
+
+ // физическая r
+ const PW=phys.width,PH=phys.height;
+ pctx.fillStyle='#000'; pctx.fillRect(0,0,PW,PH);
+ const rMax=40, bins=new Float64Array(PW);
+ for(let i=1;i<N-1;i++){
+  const r=rOfX[i]; if(r>rMax)continue;
+  const x=Math.floor((r-1)/(rMax-1)*(PW-1));
+  bins[x]+=phi[i]*phi[i]/Math.max(1-1/r,1e-3);
+ }
+ let bm=0; for(let b=0;b<PW;b++)bm=Math.max(bm,bins[b]);
+ pctx.strokeStyle='#7cf'; pctx.beginPath();
+ for(let b=0;b<PW;b++){
+  const y=PH-4-(bins[b]/(bm||1))*(PH-20);
+  b?pctx.lineTo(b,y):pctx.moveTo(b,y);
+ }
+ pctx.stroke();
+ pctx.fillStyle='#888'; pctx.fillText('плотность по физической r (накопление у горизонта)',8,14);
+
+ const R=incS>1e-7?Math.min(1,refS/incS):0;
+ const T=incS>1e-7?Math.min(1,transS/incS):0;
+ info.textContent=
+  `режим: ${mode==='flux'?'поток':'импульс'} | t=${time.toFixed(0)} | ω²=${(k0*k0).toFixed(2)} | Vmax=${Vmax.toFixed(2)} | `+
+  `R≈${(100*R).toFixed(1)}% | T≈${(100*T).toFixed(1)}% | квантов: упало ${pFallen}, отразилось ${pEscaped}`;
+}
+
+function frame(){
+ if(running){
+  const dtFrame=dt*stepsPerFrame;
+  for(let s=0;s<stepsPerFrame;s++) step();
+  computeFlux();
+  updateParticles(dtFrame);
+ }
+ draw();
+ requestAnimationFrame(frame);
+}
+
+modeEl.addEventListener('change',()=>{mode=modeEl.value; init();});
+k0El.addEventListener('input',()=>{k0=+k0El.value; k0Val.textContent=k0.toFixed(2); init();});
+ampEl.addEventListener('input',()=>{srcAmp=+ampEl.value; ampVal.textContent=srcAmp.toFixed(2);});
+stepsEl.addEventListener('input',()=>{stepsPerFrame=+stepsEl.value; stepsVal.textContent=stepsEl.value;});
+pauseBtn.addEventListener('click',()=>{running=!running; pauseBtn.textContent=running?'Пауза':'Старт';});
+resetBtn.addEventListener('click',init);
+
+init(); frame();
+</script>
+</body>
+</html>

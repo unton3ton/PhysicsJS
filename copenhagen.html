@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Двухщелевой эксперимент: Копенгаген vs Многомировая</title>
+<style>
+ body{background:#0d0d14;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#05050a;border:1px solid #333;display:block;margin:8px 0;}
+ .controls{display:flex;gap:16px;flex-wrap:wrap;align-items:center;}
+ label{font-size:14px;}
+ #note{color:#889;font-size:13px;max-width:960px;}
+</style>
+</head>
+<body>
+<h2>Двухщелевой эксперимент: одна вселенная и многомировая</h2>
+<div class="controls">
+ <label>интерпретация:
+  <select id="mode">
+   <option value="copenhagen">одна вселенная (Копенгаген)</option>
+   <option value="mw">многомировая (Эверетт)</option>
+  </select>
+ </label>
+ <label><input id="det" type="checkbox"> детектор «какой щели»</label>
+ <label>темп: <input id="tempo" type="range" min="0.2" max="2" step="0.1" value="0.9"> <span id="tempoVal">0.9</span> c</label>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+<canvas id="c" width="960" height="640"></canvas>
+<div id="note">
+ Копенгаген: частица летит как волна, детектируется как частица; измерение пути разрушает интерференцию.
+ Эверетт: волна никогда не коллапсирует — каждое измерение ветвит вселенную, и в каждой ветви своя история попаданий при той же статистике |ψ|².
+</div>
+<script>
+"use strict";
+const canvas=document.getElementById('c'), ctx=canvas.getContext('2d');
+const W=960,H=640,STRIP=96;
+const appTop=STRIP+40, appBottom=H-30;
+const yc=(appTop+appBottom)/2;
+const sourceX=90, barrierX=470, screenX=850;
+const slitOff=60, slitHalf=11, sy=[yc-slitOff,yc+slitOff];
+const BINS=110;
+
+const modeEl=document.getElementById('mode'), detEl=document.getElementById('det');
+const tempoEl=document.getElementById('tempo'), tempoVal=document.getElementById('tempoVal');
+const pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+let mode='copenhagen', detector=false, tempo=0.9, running=true;
+let particleNum=0, waitT=0.4, p=null;
+let dots=[];                       // копенгаген
+let leaves=[], activeBranch=null;  // многомировая
+let universes=1, branchSeq=0;
+let splitAnim=0; const SPLIT_FRAMES=50;
+const snap=document.createElement('canvas'); snap.width=W; snap.height=H;
+const snctx=snap.getContext('2d');
+
+// ---------- распределения ----------
+function G(y,m,s){ return Math.exp(-((y-m)*(y-m))/(2*s*s)); }
+function interfFn(y){ return G(y,yc,140)*Math.pow(Math.cos(Math.PI*(y-yc)/42),2); }
+function whichFn(y){ return 0.5*G(y,yc-60,80)+0.5*G(y,yc+60,80); }
+function slitAFn(y){ return G(y,yc-60,80); }
+function slitBFn(y){ return G(y,yc+60,80); }
+
+const cdfs={};
+function buildCDF(name,fn){
+ const n=240,c=new Float64Array(n); let sum=0;
+ for(let i=0;i<n;i++){ const y=appTop+(i+0.5)/n*(appBottom-appTop); c[i]=fn(y); sum+=c[i]; }
+ let a=0;
+ for(let i=0;i<n;i++){ a+=c[i]/sum; c[i]=a; }
+ cdfs[name]=c;
+}
+buildCDF('interf',interfFn); buildCDF('which',whichFn);
+buildCDF('slitA',slitAFn); buildCDF('slitB',slitBFn);
+
+function sample(name){
+ const c=cdfs[name], u=Math.random();
+ let lo=0,hi=c.length-1;
+ while(lo<hi){ const m=(lo+hi)>>1; if(c[m]<u)lo=m+1; else hi=m; }
+ return appTop+(lo+0.5)/c.length*(appBottom-appTop);
+}
+
+// ---------- ветви ----------
+function reset(){
+ dots=[]; leaves=[]; branchSeq=0; universes=1;
+ particleNum=0; p=null; waitT=0.4; splitAnim=0;
+ activeBranch={id:++branchSeq,label:'начальная ветвь',dots:[]};
+ leaves=[activeBranch];
+}
+
+// ---------- цикл частицы ----------
+const T1=0.8,T2=1.5,T3=0.55;
+
+function launch(){ particleNum++; p={n:particleNum,phase:1,t:0,yHit:0,slit:-1}; }
+
+function update(dt){
+ if(splitAnim>0)splitAnim--;
+ if(!p){ waitT-=dt; if(waitT<=0)launch(); return; }
+ p.t+=dt;
+ if(p.phase===1&&p.t>=T1){
+  p.phase=2; p.t=0;
+  if(mode==='copenhagen'&&detector){
+   p.slit=Math.random()<0.5?0:1;
+   p.yHit=sample('which');
+  } else if(mode==='copenhagen'){
+   p.yHit=sample('interf');
+  } else {
+   p.yHit=sample(detector?'which':'interf');
+  }
+ } else if(p.phase===2&&p.t>=T2){
+  detect();
+ } else if(p.phase===3&&p.t>=T3){
+  p=null; waitT=tempo;
+ }
+}
+
+function detect(){
+ p.phase=3; p.t=0;
+ if(mode==='copenhagen'){
+  dots.push({y:p.yHit,n:p.n});
+  if(dots.length>700)dots.shift();
+ } else {
+  snctx.clearRect(0,0,W,H); snctx.drawImage(canvas,0,0);
+  splitAnim=SPLIT_FRAMES;
+  universes*=2;
+  // остальные ветви тоже получают свою частицу
+  for(const l of leaves){
+   if(l===activeBranch)continue;
+   l.dots.push({y:sample(detector?'which':'interf'),n:p.n});
+   if(l.dots.length>400)l.dots.shift();
+  }
+  let yA,yB,labA,labB;
+  if(detector){
+   yA=sample('slitA'); yB=sample('slitB');
+   labA='запись: щель A'; labB='запись: щель B';
+  } else {
+   yA=sample('interf'); yB=sample('interf');
+   labA='точка y='+Math.round(yA-yc); labB='точка y='+Math.round(yB-yc);
+  }
+  const base=activeBranch.dots;
+  const b1={id:++branchSeq,label:labA,dots:base.concat([{y:yA,n:p.n}])};
+  const b2={id:++branchSeq,label:labB,dots:base.concat([{y:yB,n:p.n}])};
+  leaves=leaves.filter(l=>l!==activeBranch).concat([b1,b2]);
+  if(leaves.length>16)leaves.splice(0,leaves.length-16);
+  activeBranch=Math.random()<0.5?b1:b2;
+ }
+}
+
+// ---------- поле за щелями ----------
+const fcan=document.createElement('canvas'); fcan.width=130; fcan.height=100;
+const fctx=fcan.getContext('2d'); const fimg=fctx.createImageData(130,100);
+const FW=130,FH=100,K=2*Math.PI/30,OM=K*150;
+
+function renderField(t2,slitOnly){
+ const spanX=screenX-barrierX, spanY=appBottom-appTop;
+ const arr=new Float32Array(FW*FH);
+ for(let gy=0;gy<FH;gy++){
+  const y=appTop+(gy+0.5)/FH*spanY;
+  for(let gx=0;gx<FW;gx++){
+   const x=barrierX+(gx+0.5)/FW*spanX;
+   let re=0,im=0;
+   for(let s=0;s<2;s++){
+    if(slitOnly>=0&&s!==slitOnly)continue;
+    const r=Math.hypot(x-barrierX,y-sy[s]);
+    const amp=1/(0.4+r/260);
+    const ph=K*r-OM*t2;
+    re+=amp*Math.cos(ph); im+=amp*Math.sin(ph);
+   }
+   arr[gy*FW+gx]=re*re+im*im;
+  }
+ }
+ const d=fimg.data;
+ for(let i=0;i<FW*FH;i++){
+  const t=Math.min(1,arr[i]/5.0);
+  d[i*4]  =8+222*Math.pow(t,1.15);
+  d[i*4+1]=12+238*Math.pow(t,0.95);
+  d[i*4+2]=55+200*Math.sqrt(t);
+  d[i*4+3]=235;
+ }
+ fctx.putImageData(fimg,0,0);
+ ctx.save(); ctx.globalAlpha=0.92;
+ ctx.drawImage(fcan,barrierX,appTop,spanX,spanY);
+ ctx.restore();
+}
+
+// ---------- отрисовка ----------
+function drawStrip(){
+ ctx.fillStyle='#0b0e18'; ctx.fillRect(0,0,W,STRIP);
+ ctx.strokeStyle='#222a3d';
+ ctx.beginPath(); ctx.moveTo(0,STRIP); ctx.lineTo(W,STRIP); ctx.stroke();
+
+ ctx.fillStyle='#889'; ctx.font='12px system-ui';
+ ctx.textAlign='right';
+ ctx.fillText('частиц: '+particleNum,W-12,STRIP-8);
+ ctx.textAlign='left';
+
+ if(mode==='copenhagen'){
+  ctx.fillStyle='#9ad'; ctx.font='bold 14px system-ui';
+  ctx.fillText('Одна вселенная (Копенгаген)',14,22);
+  ctx.fillStyle='#789'; ctx.font='12px system-ui';
+  ctx.fillText(detector
+   ?'детектор измеряет путь → P = |ψ₁|²+|ψ₂|² (интерференции нет)'
+   :'волна через обе щели → P = |ψ₁+ψ₂|²; в момент детекции — коллапс',14,42);
+  drawTheoryCurve(430,8,390,80);
+ } else {
+  ctx.fillStyle='#ffd43b'; ctx.font='bold 14px system-ui';
+  ctx.fillText('Многомировая (Эверетт) · вселенных: '+fmt(universes),14,22);
+  ctx.fillStyle='#789'; ctx.font='12px system-ui';
+  ctx.fillText('без коллапса: каждая детекция ветвит вселенную; ниже — последние ветви (у каждой своя история)',14,42);
+  drawGallery();
+ }
+}
+
+function drawTheoryCurve(x0,y0,w,h){
+ const fn=detector?whichFn:interfFn;
+ let mx=1e-9;
+ for(let i=0;i<=w;i++){ const y=appTop+i/w*(appBottom-appTop); mx=Math.max(mx,fn(y)); }
+ ctx.strokeStyle='rgba(140,200,255,0.85)'; ctx.lineWidth=1.5;
+ ctx.beginPath();
+ for(let i=0;i<=w;i++){
+  const y=appTop+i/w*(appBottom-appTop);
+  const v=fn(y)/mx;
+  const px=x0+i, py=y0+h-6-v*(h-18);
+  i?ctx.lineTo(px,py):ctx.moveTo(px,py);
+ }
+ ctx.stroke();
+ ctx.fillStyle='#567'; ctx.font='10px system-ui';
+ ctx.fillText((detector?'P(y)=|ψ₁|²+|ψ₂|²':'P(y)=|ψ₁+ψ₂|²')+' (развёртка экрана)',x0,y0+10);
+}
+
+function drawGallery(){
+ const list=leaves.slice(-6);
+ let x=14;
+ for(const b of list){
+  const w=146,h=42,y=50;
+  const active=b===activeBranch;
+  ctx.fillStyle='#101527'; ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle=active?'#00e5ff':'#33415f';
+  ctx.strokeRect(x,y,w,h);
+  const counts=new Float64Array(40);
+  for(const d of b.dots){
+   const bb=Math.min(39,Math.max(0,Math.floor((d.y-appTop)/(appBottom-appTop)*40)));
+   counts[bb]++;
+  }
+  ctx.fillStyle=active?'rgba(0,229,255,0.85)':'rgba(140,160,200,0.7)';
+  for(let i=0;i<40;i++){
+   if(!counts[i])continue;
+   ctx.fillRect(x+3,y+3+i/40*(h-6),Math.min(58,counts[i]*13),2.2);
+  }
+  ctx.fillStyle=active?'#bff':'#99a'; ctx.font='10px system-ui';
+  ctx.fillText('ветвь #'+b.id,x+70,y+13);
+  ctx.fillText(b.label,x+70,y+25);
+  if(active)ctx.fillText('вы здесь',x+70,y+37);
+  x+=w+8;
+ }
+}
+
+function drawApparatus(){
+ ctx.fillStyle='#2a3550'; ctx.fillRect(sourceX-34,yc-24,44,48);
+ ctx.fillStyle='#9fb8ff'; ctx.font='12px system-ui';
+ ctx.fillText('источник',sourceX-30,yc-32);
+
+ ctx.fillStyle='#555e6e';
+ const bw=10;
+ ctx.fillRect(barrierX-bw/2,appTop,bw,sy[0]-slitHalf-appTop);
+ ctx.fillRect(barrierX-bw/2,sy[0]+slitHalf,bw,(sy[1]-slitHalf)-(sy[0]+slitHalf));
+ ctx.fillRect(barrierX-bw/2,sy[1]+slitHalf,bw,appBottom-(sy[1]+slitHalf));
+ ctx.fillStyle='#c7d2e8';
+ ctx.fillText('щель A',barrierX-56,sy[0]+4);
+ ctx.fillText('щель B',barrierX-56,sy[1]+4);
+
+ if(detector){
+  ctx.fillStyle='#ffd43b';
+  ctx.fillRect(barrierX+8,sy[0]-6,8,12);
+  ctx.fillRect(barrierX+8,sy[1]-6,8,12);
+  ctx.fillText('детектор пути',barrierX+20,sy[0]-14);
+ }
+
+ ctx.strokeStyle='#e8f1ff'; ctx.lineWidth=3;
+ ctx.beginPath(); ctx.moveTo(screenX,appTop); ctx.lineTo(screenX,appBottom); ctx.stroke();
+ ctx.fillStyle='#e8f1ff'; ctx.fillText('экран',screenX+16,appTop+12);
+}
+
+function currentDots(){
+ return mode==='copenhagen'?dots:(activeBranch?activeBranch.dots:[]);
+}
+
+function drawScreenData(){
+ const dd=currentDots();
+ const counts=new Float64Array(BINS); let mx=1;
+ for(const d of dd){
+  const b=Math.min(BINS-1,Math.max(0,Math.floor((d.y-appTop)/(appBottom-appTop)*BINS)));
+  counts[b]++;
+ }
+ for(let b=0;b<BINS;b++)if(counts[b]>mx)mx=counts[b];
+ ctx.fillStyle='rgba(120,200,255,0.6)';
+ for(let b=0;b<BINS;b++){
+  if(!counts[b])continue;
+  const y=appTop+b/BINS*(appBottom-appTop);
+  ctx.fillRect(screenX+8,y,4+counts[b]/mx*66,(appBottom-appTop)/BINS-0.5);
+ }
+ for(let i=0;i<dd.length;i++){
+  const d=dd[i];
+  ctx.fillStyle='#ffd76a';
+  ctx.fillRect(screenX-2,d.y-1.5,4,3);
+  if(i>=dd.length-10){
+   ctx.fillStyle='#ffe9b0'; ctx.font='10px system-ui';
+   ctx.fillText(d.n,screenX-26,d.y+3);
+  }
+ }
+}
+
+function drawParticle(){
+ if(!p)return;
+ ctx.font='12px system-ui';
+ if(p.phase===1){
+  const f=p.t/T1;
+  const x=sourceX+20+(barrierX-sourceX-30)*f;
+  ctx.strokeStyle='rgba(120,220,255,0.5)';
+  for(let m=0;m<4;m++){
+   const r=p.t*150-m*30;
+   if(r>4){ ctx.beginPath(); ctx.arc(sourceX+16,yc,r,-0.9,0.9); ctx.stroke(); }
+  }
+  ctx.fillStyle='#ffd76a';
+  ctx.beginPath(); ctx.arc(x,yc,5,0,7); ctx.fill();
+  ctx.fillStyle='#ffe9b0';
+  ctx.fillText('частица '+p.n,x-28,yc-14);
+ } else if(p.phase===2){
+  if(mode==='copenhagen'&&detector){
+   const f=p.t/T2;
+   const x0=barrierX+8, y0=sy[p.slit];
+   const x=x0+(screenX-x0)*f, y=y0+(p.yHit-y0)*f;
+   ctx.fillStyle='#ffd76a';
+   ctx.beginPath(); ctx.arc(x,y,5,0,7); ctx.fill();
+   ctx.fillStyle='#ffe9b0';
+   ctx.fillText('частица '+p.n+' → щель '+(p.slit?'B':'A'),x-34,y-14);
+  } else {
+   ctx.fillStyle='rgba(160,220,255,0.9)';
+   ctx.fillText('частица '+p.n+': суперпозиция двух путей',barrierX+24,appTop+16);
+  }
+ } else if(p.phase===3&&mode==='copenhagen'){
+  const f=Math.min(1,p.t/T3);
+  ctx.strokeStyle='rgba(255,120,120,'+(1-f)+')';
+  ctx.beginPath(); ctx.arc(screenX,p.yHit,(1-f)*70+4,0,7); ctx.stroke();
+  ctx.fillStyle='#ff9090';
+  ctx.fillText('коллапс',screenX-72,p.yHit-16);
+ }
+}
+
+function drawCaption(){
+ ctx.fillStyle='#667'; ctx.font='12px system-ui';
+ let s;
+ if(mode==='copenhagen'){
+  s=detector
+   ?'путь известен → интерференция исчезает (комплементарность)'
+   :'частица летит как волна, детектируется как частица; P(y)=|ψ₁+ψ₂|²';
+ } else {
+  s=detector
+   ?'детектор запутывается с частицей → ветвление по записям «щель A» / «щель B»'
+   :'все исходы реализуются в разных ветвях; наблюдатель в каждой ветви видит статистику |ψ|²';
+ }
+ ctx.fillText(s,14,H-10);
+}
+
+function drawSplit(){
+ const pr=1-splitAnim/SPLIT_FRAMES;
+ ctx.fillStyle='rgba(4,4,10,0.5)'; ctx.fillRect(0,0,W,H);
+ const off=140*pr, th=0.08*pr;
+ ctx.save(); ctx.globalAlpha=0.9;
+ ctx.translate(W/2,H/2); ctx.rotate(-th); ctx.translate(-W/2-off,-H/2);
+ ctx.drawImage(snap,0,0); ctx.restore();
+ ctx.save(); ctx.globalAlpha=0.75;
+ ctx.translate(W/2,H/2); ctx.rotate(th); ctx.translate(-W/2+off,-H/2);
+ ctx.drawImage(snap,0,0); ctx.restore();
+ ctx.fillStyle='#ffd43b'; ctx.font='bold 20px system-ui'; ctx.textAlign='center';
+ ctx.fillText('ВСЕЛЕННАЯ РАСЩЕПИЛАСЬ: обе ветви реальны',W/2,H/2);
+ ctx.textAlign='left';
+}
+
+function fmt(n){ return n>1e6?n.toExponential(1):String(n); }
+
+function render(){
+ ctx.fillStyle='#05050a'; ctx.fillRect(0,0,W,H);
+ drawStrip();
+ drawApparatus();
+ if(p&&p.phase===2){
+  if(mode==='copenhagen'&&detector)renderField(p.t,p.slit);
+  else renderField(p.t,-1);
+ }
+ drawParticle();
+ drawScreenData();
+ drawCaption();
+ if(splitAnim>0)drawSplit();
+}
+
+// ---------- цикл ----------
+let last=performance.now();
+function frame(now){
+ const dt=Math.min(0.05,(now-last)/1000); last=now;
+ if(running)update(dt);
+ render();
+ requestAnimationFrame(frame);
+}
+
+// ---------- управление ----------
+modeEl.addEventListener('change',()=>{ mode=modeEl.value; reset(); });
+detEl.addEventListener('change',()=>{ detector=detEl.checked; });
+tempoEl.addEventListener('input',()=>{ tempo=+tempoEl.value; tempoVal.textContent=tempo.toFixed(1); });
+pauseBtn.addEventListener('click',()=>{ running=!running; pauseBtn.textContent=running?'Пауза':'Старт'; });
+resetBtn.addEventListener('click',reset);
+
+reset();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
