@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Уравнение Дирака 2D: релятивистский электрон со спином</title>
+<style>
+ body{background:#101018;color:#eee;font-family:system-ui;margin:16px;}
+ canvas{background:#000;border:1px solid #333;display:block;margin:10px 0;}
+ .controls{display:flex;gap:16px;flex-wrap:wrap;align-items:center;}
+ .controls label{font-size:13px;}
+ #readout{font-family:monospace;color:#9fd;}
+ #note{color:#889;font-size:13px;max-width:680px;}
+ select,input[type=range]{vertical-align:middle;}
+</style>
+</head>
+<body>
+<h2>Уравнение Дирака (2+1D): i∂ₜψ = (σ·p + mσ_z + V)ψ</h2>
+
+<div class="controls">
+ <label>потенциал:
+  <select id="pot">
+   <option value="slit">барьер со щелью</option>
+   <option value="bump">гауссов «шар»</option>
+   <option value="step">ступенька (Кляйн)</option>
+   <option value="none">свободный</option>
+  </select>
+ </label>
+ <label>V₀: <input id="v0" type="range" min="0" max="4" step="0.05" value="2"> <span id="v0Val">2</span></label>
+ <label>масса m: <input id="mass" type="range" min="0" max="1.5" step="0.02" value="0.2"> <span id="massVal">0.2</span></label>
+ <label>импульс k₀: <input id="k0" type="range" min="0.2" max="1.5" step="0.02" value="0.8"> <span id="k0Val">0.8</span></label>
+ <label>спин:
+  <select id="spin">
+   <option value="up">↑ z</option>
+   <option value="down">↓ z</option>
+   <option value="x">→ x</option>
+   <option value="y">↻ y</option>
+  </select>
+ </label>
+ <label>вид:
+  <select id="view">
+   <option value="spin">спин-текстура</option>
+   <option value="density">плотность |ψ|²</option>
+  </select>
+ </label>
+ <label>размер:
+  <select id="size"><option value="128">128²</option><option value="256">256²</option></select>
+ </label>
+ <label>шагов/кадр: <input id="speed" type="range" min="1" max="10" value="4"> <span id="speedVal">4</span></label>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+
+<canvas id="c" width="640" height="640"></canvas>
+<div id="readout"></div>
+<div id="note">
+ Цвет = направление спина ⟨σ⟩ (R=σₓ, G=σ_y, B=σ_z), яркость = |ψ|².
+ Серым подсвечен потенциал V. Схема: стрэг-сплиттинг Фурье, унитарная, без удвоения фермионов.
+ Режим «ступенька» с большим V₀ показывает туннелирование Кляйна.
+</div>
+
+<script>
+"use strict";
+const cvs=document.getElementById('c'), ctx=cvs.getContext('2d');
+const readout=document.getElementById('readout');
+const ocv=document.createElement('canvas'), octx=ocv.getContext('2d');
+let img;
+
+const potEl=document.getElementById('pot');
+const v0El=document.getElementById('v0'), v0Val=document.getElementById('v0Val');
+const massEl=document.getElementById('mass'), massVal=document.getElementById('massVal');
+const k0El=document.getElementById('k0'), k0Val=document.getElementById('k0Val');
+const spinEl=document.getElementById('spin');
+const viewEl=document.getElementById('view');
+const sizeEl=document.getElementById('size');
+const speedEl=document.getElementById('speed'), speedVal=document.getElementById('speedVal');
+const pauseBtn=document.getElementById('pause'), resetBtn=document.getElementById('reset');
+
+// ---------- параметры ----------
+let N=128, NN=N*N;
+const dt=0.4;
+let potType='slit', barrierV0=2, mass=0.2, k0=0.8, spinPrep='up', view='spin';
+let substeps=4, running=true, tGlobal=0, lastNorm=1;
+
+let re1,im1,re2,im2,Varr,dens,dampHalf,KX,KY,_tRe,_tIm;
+
+// ---------- выделение памяти ----------
+function allocate(){
+ NN=N*N;
+ re1=new Float64Array(NN); im1=new Float64Array(NN);
+ re2=new Float64Array(NN); im2=new Float64Array(NN);
+ Varr=new Float64Array(NN); dens=new Float64Array(NN);
+ dampHalf=new Float64Array(NN);
+ KX=new Float64Array(N); KY=new Float64Array(N);
+ _tRe=new Float64Array(N); _tIm=new Float64Array(N);
+ ocv.width=N; ocv.height=N;
+ img=octx.createImageData(N,N);
+ for(let i=0;i<N;i++){ const f=i<N/2?i:i-N; KX[i]=2*Math.PI*f/N; KY[i]=2*Math.PI*f/N; }
+ buildSponge();
+}
+
+function buildSponge(){
+ const w=Math.floor(N*0.08);
+ for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+  const d=Math.min(i,N-1-i,j,N-1-j);
+  let W=0;
+  if(d<w){ const f=1-d/w; W=0.6*f*f; }
+  dampHalf[j*N+i]=Math.exp(-W*dt/2);
+ }
+}
+
+function buildPotential(){
+ const cy=N/2;
+ for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+  const idx=j*N+i; let V=0;
+  if(potType==='slit'){
+   const bx=Math.floor(0.62*N);
+   if(i>=bx&&i<bx+5){
+    const gapHalf=Math.floor(0.055*N);
+    if(Math.abs(j-cy)>gapHalf) V=barrierV0;
+   }
+  } else if(potType==='bump'){
+   const bx=Math.floor(0.6*N), s=N*0.09;
+   const r2=(i-bx)*(i-bx)+(j-cy)*(j-cy);
+   V=barrierV0*Math.exp(-r2/(2*s*s));
+  } else if(potType==='step'){
+   if(i>0.5*N) V=barrierV0;
+  }
+  Varr[idx]=V;
+ }
+}
+
+function initPacket(){
+ const cx=Math.floor(0.2*N), cy=N/2, sig=N*0.06;
+ let s1re=1,s1im=0,s2re=0,s2im=0;
+ if(spinPrep==='down'){s1re=0;s2re=1;}
+ else if(spinPrep==='x'){s1re=0.7071;s2re=0.7071;}
+ else if(spinPrep==='y'){s1re=0.7071;s2im=0.7071;}
+ let norm=0;
+ for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+  const g=Math.exp(-((i-cx)*(i-cx)+(j-cy)*(j-cy))/(4*sig*sig));
+  norm+=g*g;
+ }
+ const inv=1/Math.sqrt(norm);
+ for(let j=0;j<N;j++)for(let i=0;i<N;i++){
+  const idx=j*N+i;
+  const g=Math.exp(-((i-cx)*(i-cx)+(j-cy)*(j-cy))/(4*sig*sig))*inv;
+  const ph=k0*i, c=Math.cos(ph), s=Math.sin(ph);
+  re1[idx]=g*(c*s1re - s*s1im); im1[idx]=g*(c*s1im + s*s1re);
+  re2[idx]=g*(c*s2re - s*s2im); im2[idx]=g*(c*s2im + s*s2re);
+ }
+}
+
+// ---------- FFT ----------
+function fft1d(re,im,invert){
+ const n=re.length;
+ for(let i=1,j=0;i<n;i++){
+  let bit=n>>1;
+  for(; j&bit; bit>>=1) j^=bit;
+  j^=bit;
+  if(i<j){
+   let t=re[i];re[i]=re[j];re[j]=t;
+   t=im[i];im[i]=im[j];im[j]=t;
+  }
+ }
+ for(let len=2;len<=n;len<<=1){
+  const ang=2*Math.PI/len*(invert?1:-1);
+  const wr=Math.cos(ang), wi=Math.sin(ang);
+  for(let i=0;i<n;i+=len){
+   let cr=1,ci=0;
+   for(let j=0;j<len/2;j++){
+    const ur=re[i+j], ui=im[i+j];
+    const vr=re[i+j+len/2]*cr - im[i+j+len/2]*ci;
+    const vi=re[i+j+len/2]*ci + im[i+j+len/2]*cr;
+    re[i+j]=ur+vr; im[i+j]=ui+vi;
+    re[i+j+len/2]=ur-vr; im[i+j+len/2]=ui-vi;
+    const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr;
+   }
+  }
+ }
+ if(invert){ for(let i=0;i<n;i++){re[i]/=n; im[i]/=n;} }
+}
+
+function fft2d(re,im,invert){
+ for(let r=0;r<N;r++){
+  const o=r*N;
+  for(let c=0;c<N;c++){_tRe[c]=re[o+c];_tIm[c]=im[o+c];}
+  fft1d(_tRe,_tIm,invert);
+  for(let c=0;c<N;c++){re[o+c]=_tRe[c];im[o+c]=_tIm[c];}
+ }
+ for(let c=0;c<N;c++){
+  for(let r=0;r<N;r++){_tRe[r]=re[r*N+c];_tIm[r]=im[r*N+c];}
+  fft1d(_tRe,_tIm,invert);
+  for(let r=0;r<N;r++){re[r*N+c]=_tRe[r];im[r*N+c]=_tIm[r];}
+ }
+}
+
+// ---------- шаг по времени ----------
+function halfPotential(h){
+ for(let idx=0;idx<NN;idx++){
+  const V=Varr[idx], dm=dampHalf[idx];
+  const p1=-(V+mass)*h, p2=-(V-mass)*h;
+  const c1=Math.cos(p1),s1=Math.sin(p1),c2=Math.cos(p2),s2=Math.sin(p2);
+  let a=re1[idx],b=im1[idx];
+  re1[idx]=(a*c1+b*s1)*dm; im1[idx]=(b*c1-a*s1)*dm;
+  a=re2[idx];b=im2[idx];
+  re2[idx]=(a*c2+b*s2)*dm; im2[idx]=(b*c2-a*s2)*dm;
+ }
+}
+
+function kinetic(dtf){
+ fft2d(re1,im1,false); fft2d(re2,im2,false);
+ for(let j=0;j<N;j++){
+  const ky=KY[j];
+  for(let i=0;i<N;i++){
+   const kx=KX[i], idx=j*N+i;
+   const k2=kx*kx+ky*ky;
+   if(k2<1e-14)continue;
+   const kap=Math.sqrt(k2), th=kap*dtf;
+   const c=Math.cos(th), s=Math.sin(th);
+   const ux=kx/kap, uy=ky/kap;
+   const ar=re1[idx],ai=im1[idx],br=re2[idx],bi=im2[idx];
+   const w1r=ux*br+uy*bi, w1i=ux*bi-uy*br;   // u*ψ2, u=(kx-i ky)/kap
+   const w2r=ux*ar-uy*ai, w2i=ux*ai+uy*ar;   // conj(u)*ψ1
+   re1[idx]=c*ar+s*w1i; im1[idx]=c*ai-s*w1r;
+   re2[idx]=c*br+s*w2i; im2[idx]=c*bi-s*w2r;
+  }
+ }
+ fft2d(re1,im1,true); fft2d(re2,im2,true);
+}
+
+function step(h){ halfPotential(h/2); kinetic(h); halfPotential(h/2); }
+
+// ---------- отрисовка ----------
+function render(){
+ let mx=1e-12, norm=0, vx=0, vy=0;
+ for(let idx=0;idx<NN;idx++){
+  const a=re1[idx],b=im1[idx],c=re2[idx],d=im2[idx];
+  const rho=a*a+b*b+c*c+d*d;
+  dens[idx]=rho; norm+=rho;
+  vx+=2*(a*c+b*d); vy+=2*(a*d-b*c);
+  if(rho>mx)mx=rho;
+ }
+ lastNorm=norm;
+ const data=img.data;
+ const showSpin=(view==='spin');
+ for(let idx=0;idx<NN;idx++){
+  const rho=dens[idx];
+  let r,g,b;
+  if(showSpin){
+   const bright=Math.sqrt(rho/mx);
+   if(rho>1e-14){
+    const a=re1[idx],bb=im1[idx],c=re2[idx],d=im2[idx];
+    const sx=2*(a*c+bb*d)/rho, sy=2*(a*d-bb*c)/rho, sz=(a*a+bb*bb-c*c-d*d)/rho;
+    r=255*bright*0.5*(1+sx); g=255*bright*0.5*(1+sy); b=255*bright*0.5*(1+sz);
+   } else {r=g=b=0;}
+  } else {
+   const t=Math.sqrt(rho/mx);
+   r=255*Math.min(1,1.7*t);
+   g=255*Math.max(0,Math.min(1,1.7*t-0.5));
+   b=20+255*Math.max(0,1.7*t-1.0);
+  }
+  const V=Varr[idx];
+  if(V>0.02){ const vv=Math.min(1,V/Math.max(0.1,barrierV0))*0.5;
+   r=r*(1-vv)+175*vv; g=g*(1-vv)+178*vv; b=b*(1-vv)+185*vv; }
+  const p=idx*4;
+  data[p]=r;data[p+1]=g;data[p+2]=b;data[p+3]=255;
+ }
+ octx.putImageData(img,0,0);
+ ctx.imageSmoothingEnabled=true;
+ ctx.fillStyle='#000';ctx.fillRect(0,0,cvs.width,cvs.height);
+ ctx.drawImage(ocv,0,0,cvs.width,cvs.height);
+ const sp=Math.hypot(vx,vy)/Math.max(norm,1e-9);
+ readout.textContent=`t=${tGlobal.toFixed(1)}   норма=${norm.toFixed(3)}   `+
+  `⟨v⟩/c=(${(vx/Math.max(norm,1e-9)).toFixed(2)}, ${(vy/Math.max(norm,1e-9)).toFixed(2)})   |⟨v⟩|/c=${sp.toFixed(2)}   E=√(k₀²+m²)=${Math.sqrt(k0*k0+mass*mass).toFixed(2)}`;
+}
+
+// ---------- цикл ----------
+function frame(){
+ if(running){ for(let s=0;s<substeps;s++){ step(dt); tGlobal+=dt; } }
+ render();
+ if(running && lastNorm<0.1) initPacket();
+ requestAnimationFrame(frame);
+}
+
+// ---------- управление ----------
+function fullInit(){ allocate(); buildPotential(); initPacket(); tGlobal=0; }
+
+potEl.addEventListener('change',()=>{potType=potEl.value;buildPotential();});
+v0El.addEventListener('input',()=>{barrierV0=+v0El.value;v0Val.textContent=barrierV0;buildPotential();});
+massEl.addEventListener('input',()=>{mass=+massEl.value;massVal.textContent=mass;});
+k0El.addEventListener('input',()=>{k0=+k0El.value;k0Val.textContent=k0;initPacket();});
+spinEl.addEventListener('change',()=>{spinPrep=spinEl.value;initPacket();});
+viewEl.addEventListener('change',()=>{view=viewEl.value;});
+sizeEl.addEventListener('change',()=>{N=+sizeEl.value;fullInit();});
+speedEl.addEventListener('input',()=>{substeps=+speedEl.value;speedVal.textContent=substeps;});
+pauseBtn.addEventListener('click',()=>{running=!running;pauseBtn.textContent=running?'Пауза':'Старт';});
+resetBtn.addEventListener('click',()=>{initPacket();tGlobal=0;});
+
+fullInit();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

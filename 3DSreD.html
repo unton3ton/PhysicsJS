@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>3D уравнение Шрёдингера на WebGL2</title>
+<style>
+ body{background:#0d0d14;color:#eee;font-family:system-ui;margin:14px;}
+ canvas{background:#000;border:1px solid #333;display:block;cursor:grab;}
+ .controls{display:flex;gap:14px;flex-wrap:wrap;align-items:center;margin-bottom:8px;}
+ label{font-size:13px;}
+ #note{color:#889;font-size:13px;max-width:760px;}
+</style>
+</head>
+<body>
+<h2>3D уравнение Шрёдингера: пакет рассеивается на сфере</h2>
+<div class="controls">
+ <label>потенциал:
+  <select id="pot"><option value="0">сфера</option><option value="1">стенка с отверстием</option></select>
+ </label>
+ <label>высота V₀: <input id="v0" type="range" min="0" max="3" step="0.05" value="2"><span id="v0v">2</span></label>
+ <label>радиус: <input id="rad" type="range" min="0.03" max="0.2" step="0.005" value="0.08"><span id="radv">0.08</span></label>
+ <label>импульс k₀: <input id="k0" type="range" min="0.4" max="1.6" step="0.05" value="1"><span id="k0v">1</span></label>
+ <label>сетка: <select id="grid"><option value="32">32³</option><option value="48" selected>48³</option><option value="64">64³</option></select></label>
+ <label>порог: <input id="thr" type="range" min="0" max="0.4" step="0.005" value="0.03"><span id="thrv">0.03</span></label>
+ <button id="pause">Пауза</button>
+ <button id="reset">Сброс</button>
+</div>
+<canvas id="c" width="760" height="560"></canvas>
+<div id="note">
+ Управление: вращение — мышью, масштаб — колесом. Эволюция i∂ₜψ=(−½∇²+V)ψ методом leapfrog на GPU
+ (3D-текстуры, без FFT — устойчиво на слабых картах). Цвет/яркость точек ∝ |ψ|².
+ Если тормозит — выберите сетку 32³.
+</div>
+
+<script>
+"use strict";
+const cvs=document.getElementById('c');
+const gl=cvs.getContext('webgl2',{antialias:false});
+const note=document.getElementById('note');
+if(!gl){ document.body.innerHTML='<h2>WebGL2 недоступен на этой системе 😞</h2>'; throw new Error('no webgl2'); }
+if(!gl.getExtension('EXT_color_buffer_float')){
+  document.body.innerHTML='<h2>Нет EXT_color_buffer_float — рендер в float-текстуры недоступен 😞</h2>'; throw new Error('no float rt');
+}
+console.log('WebGPU доступен?', !!navigator.gpu);
+
+// ---------- параметры ----------
+let N=48, dt=0.1, substeps=4;
+let potType=0, V0=2, sphR=0.08, k0=1.0, thresh=0.03;
+let running=true, yaw=0.6, pitch=0.5, dist=3.4;
+const sphC=[0.62,0.5,0.5];
+const packC=[0.2,0.5,0.5];
+
+// ---------- шейперы ----------
+function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
+ if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(s)+'\n'+src);return s;}
+function prog(vs,fs){const p=gl.createProgram();gl.attachShader(p,sh(gl.VERTEX_SHADER,vs));
+ gl.attachShader(p,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(p);
+ if(!gl.getProgramParameter(p,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(p));return p;}
+
+const quadVS=`#version 300 es
+void main(){vec2 p=vec2((gl_VertexID<<1)&2,gl_VertexID&2);gl_Position=vec4(p*2.0-1.0,0,1);}`;
+
+const updVFS=`#version 300 es
+precision highp float;precision highp sampler3D;
+uniform highp sampler3D uU,uV;uniform int uZ;uniform float uDt,uN;
+uniform vec3 uC;uniform float uR,uV0;uniform int uPT;
+out vec4 o;
+float pot(vec3 p){
+ if(uPT==0){float r2=dot(p-uC,p-uC);return uV0*exp(-r2/(2.0*uR*uR));}
+ else{ if(p.x>0.58&&p.x<0.63){float r2=dot(p.yz-vec2(0.5),p.yz-vec2(0.5));
+   return (r2>uR*uR)?uV0:0.0;} return 0.0;}
+}
+void main(){
+ ivec3 p=ivec3(int(gl_FragCoord.x),int(gl_FragCoord.y),uZ);
+ float u=texelFetch(uU,p,0).r, v=texelFetch(uV,p,0).r;
+ float l=texelFetch(uU,p+ivec3(1,0,0),0).r+texelFetch(uU,p-ivec3(1,0,0),0).r
+        +texelFetch(uU,p+ivec3(0,1,0),0).r+texelFetch(uU,p-ivec3(0,1,0),0).r
+        +texelFetch(uU,p+ivec3(0,0,1),0).r+texelFetch(uU,p-ivec3(0,0,1),0).r-6.0*u;
+ vec3 pos=(vec3(gl_FragCoord.xy,float(uZ))+0.5)/uN;
+ float V=pot(pos);
+ float vn=v+uDt*(0.5*l-V*u);
+ vec3 dm=min(pos,1.0-pos);float e=min(dm.x,min(dm.y,dm.z));
+ vn*=mix(0.90,1.0,smoothstep(0.0,0.08,e));
+ o=vec4(vn,0,0,1);
+}`;
+
+const updUFS=`#version 300 es
+precision highp float;precision highp sampler3D;
+uniform highp sampler3D uV,uU;uniform int uZ;uniform float uDt,uN;
+uniform vec3 uC;uniform float uR,uV0;uniform int uPT;
+out vec4 o;
+float pot(vec3 p){
+ if(uPT==0){float r2=dot(p-uC,p-uC);return uV0*exp(-r2/(2.0*uR*uR));}
+ else{ if(p.x>0.58&&p.x<0.63){float r2=dot(p.yz-vec2(0.5),p.yz-vec2(0.5));
+   return (r2>uR*uR)?uV0:0.0;} return 0.0;}
+}
+void main(){
+ ivec3 p=ivec3(int(gl_FragCoord.x),int(gl_FragCoord.y),uZ);
+ float u=texelFetch(uU,p,0).r, v=texelFetch(uV,p,0).r;
+ float l=texelFetch(uV,p+ivec3(1,0,0),0).r+texelFetch(uV,p-ivec3(1,0,0),0).r
+        +texelFetch(uV,p+ivec3(0,1,0),0).r+texelFetch(uV,p-ivec3(0,1,0),0).r
+        +texelFetch(uV,p+ivec3(0,0,1),0).r+texelFetch(uV,p-ivec3(0,0,1),0).r-6.0*v;
+ vec3 pos=(vec3(gl_FragCoord.xy,float(uZ))+0.5)/uN;
+ float V=pot(pos);
+ float un=u+uDt*(-0.5*l+V*v);
+ vec3 dm=min(pos,1.0-pos);float e=min(dm.x,min(dm.y,dm.z));
+ un*=mix(0.90,1.0,smoothstep(0.0,0.08,e));
+ o=vec4(un,0,0,1);
+}`;
+
+const cloudVS=`#version 300 es
+precision highp float;precision highp sampler3D;
+layout(location=0) in vec3 aPos;
+uniform highp sampler3D uU,uV;uniform float uN,uThr,uPt;uniform mat4 uMVP;
+out float vVal;
+void main(){
+ ivec3 ip=clamp(ivec3(aPos*uN),ivec3(0),ivec3(int(uN)-1));
+ float u=texelFetch(uU,ip,0).r, v=texelFetch(uV,ip,0).r;
+ float d=u*u+v*v;
+ if(d<uThr){gl_Position=vec4(0,0,2,1);gl_PointSize=0.0;vVal=0.0;return;}
+ vec3 wp=(aPos-0.5)*2.0;
+ gl_Position=uMVP*vec4(wp,1.0);
+ float s=clamp((d-uThr)/(0.6-uThr),0.0,1.0);
+ vVal=s;
+ float w=max(gl_Position.w,0.1);
+ gl_PointSize=clamp(uPt*(0.5+3.5*s)/w,0.0,14.0);
+}`;
+
+const cloudFS=`#version 300 es
+precision highp float;in float vVal;out vec4 f;
+void main(){vec2 c=gl_PointCoord-0.5;float r=length(c);if(r>0.5)discard;
+ vec3 col=mix(vec3(0.15,0.35,1.0),vec3(0.3,0.9,1.0),vVal);
+ col=mix(col,vec3(1.0),smoothstep(0.7,1.0,vVal));
+ float a=smoothstep(0.5,0.0,r)*(0.12+0.88*vVal);
+ f=vec4(col,a);}`;
+
+const sphVS=`#version 300 es
+layout(location=0) in vec3 aPos;uniform mat4 uMVP;uniform vec3 uC;uniform float uR;
+void main(){vec3 wp=(uC-0.5)*2.0+aPos*(uR*2.0);gl_Position=uMVP*vec4(wp,1.0);gl_PointSize=2.0;}`;
+const sphFS=`#version 300 es
+precision highp float;out vec4 f;void main(){f=vec4(1.0,0.6,0.25,0.35);}`;
+
+const pV=prog(quadVS,updVFS), pU=prog(quadVS,updUFS);
+const pC=prog(cloudVS,cloudFS), pS=prog(sphVS,sphFS);
+
+// ---------- текстуры и FBO ----------
+let texU,texV,texU2,texV2;
+const fbo=gl.createFramebuffer();
+const vao=gl.createVertexArray();
+
+function makeTex(n){
+ const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_3D,t);
+ gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+ gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_MAG_FILTER,gl.NEAREST);
+ gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+ gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ gl.texParameteri(gl.TEXTURE_3D,gl.TEXTURE_WRAP_R,gl.CLAMP_TO_EDGE);
+ gl.texImage3D(gl.TEXTURE_3D,0,gl.RGBA16F,n,n,n,0,gl.RGBA,gl.FLOAT,null);
+ return t;
+}
+
+function initWave(){
+ const n3=N*N*N;
+ const uArr=new Float32Array(n3*4), vArr=new Float32Array(n3*4);
+ const sig=N*0.08, cx=packC[0]*N, cy=packC[1]*N, cz=packC[2]*N;
+ for(let z=0;z<N;z++)for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+  const idx=(z*N*N+y*N+x)*4;
+  const dx=x-cx,dy=y-cy,dz=z-cz;
+  const g=Math.exp(-(dx*dx+dy*dy+dz*dz)/(4*sig*sig));
+  const ph=k0*(x-cx);
+  uArr[idx]=g*Math.cos(ph); vArr[idx]=g*Math.sin(ph);
+ }
+ for(const [t,arr] of [[texU,uArr],[texV,vArr],[texU2,uArr],[texV2,vArr]]){
+  gl.bindTexture(gl.TEXTURE_3D,t);
+  gl.texSubImage3D(gl.TEXTURE_3D,0,0,0,0,N,N,N,gl.RGBA,gl.FLOAT,arr);
+ }
+}
+
+function allocate(){
+ texU=makeTex(N);texV=makeTex(N);texU2=makeTex(N);texV2=makeTex(N);
+ initWave();
+}
+
+// ---------- сетка точек и сфера ----------
+let gridBuf=null,gridCount=0,sphBuf=null;const sphCount=1500;
+function buildGrid(){
+ const n3=N*N*N;const arr=new Float32Array(n3*3);let o=0;
+ for(let z=0;z<N;z++)for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+  arr[o++]=(x+0.5)/N;arr[o++]=(y+0.5)/N;arr[o++]=(z+0.5)/N;}
+ if(gridBuf)gl.deleteBuffer(gridBuf);
+ gridBuf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,gridBuf);
+ gl.bufferData(gl.ARRAY_BUFFER,arr,gl.STATIC_DRAW);gridCount=n3;
+}
+function buildSphere(){
+ const arr=new Float32Array(sphCount*3);
+ const ga=Math.PI*(3-Math.sqrt(5));
+ for(let i=0;i<sphCount;i++){
+  const yy=1-(i/(sphCount-1))*2, rr=Math.sqrt(1-yy*yy), th=ga*i;
+  arr[i*3]=Math.cos(th)*rr;arr[i*3+1]=yy;arr[i*3+2]=Math.sin(th)*rr;}
+ if(sphBuf)gl.deleteBuffer(sphBuf);
+ sphBuf=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,sphBuf);
+ gl.bufferData(gl.ARRAY_BUFFER,arr,gl.STATIC_DRAW);
+}
+
+// ---------- матрицы ----------
+function mMul(a,b){const o=new Float32Array(16);
+ for(let c=0;c<4;c++)for(let r=0;r<4;r++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+r]*b[c*4+k];o[c*4+r]=s;}return o;}
+function mPersp(fov,asp,n,f){const t=1/Math.tan(fov/2),o=new Float32Array(16);
+ o[0]=t/asp;o[5]=t;o[10]=(f+n)/(n-f);o[11]=-1;o[14]=2*f*n/(n-f);return o;}
+function mTrans(x,y,z){const o=new Float32Array(16);o[0]=1;o[5]=1;o[10]=1;o[15]=1;o[12]=x;o[13]=y;o[14]=z;return o;}
+function mRotX(a){const c=Math.cos(a),s=Math.sin(a),o=new Float32Array(16);
+ o[0]=1;o[5]=c;o[6]=s;o[9]=-s;o[10]=c;o[15]=1;return o;}
+function mRotY(a){const c=Math.cos(a),s=Math.sin(a),o=new Float32Array(16);
+ o[0]=c;o[2]=-s;o[8]=s;o[10]=c;o[5]=1;o[15]=1;return o;}
+
+// ---------- физика ----------
+function setCommon(P){
+ gl.uniform1f(gl.getUniformLocation(P,'uDt'),dt);
+ gl.uniform1f(gl.getUniformLocation(P,'uN'),N);
+ gl.uniform3fv(gl.getUniformLocation(P,'uC'),sphC);
+ gl.uniform1f(gl.getUniformLocation(P,'uR'),sphR);
+ gl.uniform1f(gl.getUniformLocation(P,'uV0'),V0);
+ gl.uniform1i(gl.getUniformLocation(P,'uPT'),potType);
+}
+function physStep(){
+ gl.bindVertexArray(vao);gl.disable(gl.BLEND);
+ // V <- V + dt*(0.5*lap U - V*U)
+ gl.useProgram(pV);setCommon(pV);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_3D,texU);gl.uniform1i(gl.getUniformLocation(pV,'uU'),0);
+ gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_3D,texV);gl.uniform1i(gl.getUniformLocation(pV,'uV'),1);
+ for(let z=0;z<N;z++){gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,texV2,0,z);
+  gl.viewport(0,0,N,N);gl.uniform1i(gl.getUniformLocation(pV,'uZ'),z);gl.drawArrays(gl.TRIANGLES,0,3);}
+ // U <- U + dt*(-0.5*lap Vnew + V*Vnew)
+ gl.useProgram(pU);setCommon(pU);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_3D,texV2);gl.uniform1i(gl.getUniformLocation(pU,'uV'),0);
+ gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_3D,texU);gl.uniform1i(gl.getUniformLocation(pU,'uU'),1);
+ for(let z=0;z<N;z++){gl.bindFramebuffer(gl.FRAMEBUFFER,fbo);
+  gl.framebufferTextureLayer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,texU2,0,z);
+  gl.viewport(0,0,N,N);gl.uniform1i(gl.getUniformLocation(pU,'uZ'),z);gl.drawArrays(gl.TRIANGLES,0,3);}
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+ let t;t=texU;texU=texU2;texU2=t;t=texV;texV=texV2;texV2=t;
+}
+
+// ---------- отрисовка ----------
+function render(){
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+ gl.viewport(0,0,cvs.width,cvs.height);
+ gl.clearColor(0.02,0.02,0.04,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+ const asp=cvs.width/cvs.height;
+ const P=mPersp(0.9,asp,0.1,50);
+ const M=mMul(mTrans(0,0,-dist),mMul(mRotX(pitch),mRotY(yaw)));
+ const MVP=mMul(P,M);
+ gl.enable(gl.BLEND);gl.blendFunc(gl.SRC_ALPHA,gl.ONE);gl.disable(gl.DEPTH_TEST);
+
+ // сфера-рассеиватель
+ gl.useProgram(pS);
+ gl.uniformMatrix4fv(gl.getUniformLocation(pS,'uMVP'),false,MVP);
+ gl.uniform3fv(gl.getUniformLocation(pS,'uC'),sphC);
+ gl.uniform1f(gl.getUniformLocation(pS,'uR'),sphR*1.6);
+ gl.bindVertexArray(vao);
+ gl.bindBuffer(gl.ARRAY_BUFFER,sphBuf);
+ gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+ gl.drawArrays(gl.POINTS,0,sphCount);
+
+ // облако плотности
+ gl.useProgram(pC);
+ gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_3D,texU);gl.uniform1i(gl.getUniformLocation(pC,'uU'),0);
+ gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_3D,texV);gl.uniform1i(gl.getUniformLocation(pC,'uV'),1);
+ gl.uniform1f(gl.getUniformLocation(pC,'uN'),N);
+ gl.uniform1f(gl.getUniformLocation(pC,'uThr'),thresh);
+ gl.uniform1f(gl.getUniformLocation(pC,'uPt'),3.2);
+ gl.uniformMatrix4fv(gl.getUniformLocation(pC,'uMVP'),false,MVP);
+ gl.bindBuffer(gl.ARRAY_BUFFER,gridBuf);
+ gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,0,0);
+ gl.drawArrays(gl.POINTS,0,gridCount);
+}
+
+// ---------- цикл ----------
+function frame(){
+ if(running){for(let s=0;s<substeps;s++)physStep();}
+ render();
+ requestAnimationFrame(frame);
+}
+
+// ---------- управление ----------
+const $=id=>document.getElementById(id);
+$('pot').onchange=e=>{potType=+e.target.value;};
+$('v0').oninput=e=>{V0=+e.target.value;$('v0v').textContent=V0;};
+$('rad').oninput=e=>{sphR=+e.target.value;$('radv').textContent=sphR;};
+$('k0').oninput=e=>{k0=+e.target.value;$('k0v').textContent=k0;};
+$('thr').oninput=e=>{thresh=+e.target.value;$('thrv').textContent=thresh;};
+$('grid').onchange=e=>{N=+e.target.value;allocate();buildGrid();};
+$('pause').onclick=()=>{running=!running;$('pause').textContent=running?'Пауза':'Старт';};
+$('reset').onclick=()=>{initWave();};
+
+let dragging=false,lx=0,ly=0;
+cvs.addEventListener('mousedown',e=>{dragging=true;lx=e.clientX;ly=e.clientY;});
+window.addEventListener('mouseup',()=>dragging=false);
+window.addEventListener('mousemove',e=>{if(!dragging)return;
+ yaw+=(e.clientX-lx)*0.008;pitch+=(e.clientY-ly)*0.008;
+ pitch=Math.max(-1.4,Math.min(1.4,pitch));lx=e.clientX;ly=e.clientY;});
+cvs.addEventListener('wheel',e=>{dist*=e.deltaY>0?1.1:0.9;dist=Math.max(1.5,Math.min(10,dist));e.preventDefault();},{passive:false});
+
+// ---------- старт ----------
+allocate();buildGrid();buildSphere();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
